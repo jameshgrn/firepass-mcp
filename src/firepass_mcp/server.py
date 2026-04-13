@@ -31,7 +31,7 @@ WRITE_CAP = 1_000_000  # 1MB max write size
 CONTEXT_CAP = 200_000  # Max characters for message context
 
 # Dangerous ripgrep flags that could allow code execution
-RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip"}
+RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip", "--replace", "-r"}
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
