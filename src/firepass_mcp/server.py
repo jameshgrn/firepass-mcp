@@ -267,10 +267,9 @@ TOOL_DEFS = [
 ]
 
 # Researcher: no write_file, edit_file, or bash
+RESEARCHER_BLOCKED_TOOLS = frozenset({"write_file", "edit_file", "bash"})
 RESEARCHER_TOOL_DEFS = [
-    t
-    for t in TOOL_DEFS
-    if t["function"]["name"] not in ("write_file", "edit_file", "bash")
+    t for t in TOOL_DEFS if t["function"]["name"] not in RESEARCHER_BLOCKED_TOOLS
 ]
 
 # ---------------------------------------------------------------------------
@@ -315,6 +314,8 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "read_file":
         try:
             p = _validate_path(args["path"], cwd)
+            if not p.is_file():
+                return f"[ERROR] Not a regular file: {args['path']}"
             off = max(args.get("offset", 1) - 1, 0)
             lim = args.get("limit")
             lines = []
@@ -352,6 +353,10 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "edit_file":
         try:
             p = _validate_path(args["path"], cwd)
+            if not p.is_file():
+                return f"[ERROR] Not a regular file: {args['path']}"
+            if p.stat().st_size > WRITE_CAP:
+                return f"[ERROR] File too large to edit ({p.stat().st_size} bytes, max {WRITE_CAP})"
             content = p.read_text()
             old = args["old_text"]
             count = content.count(old)
@@ -370,7 +375,10 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "bash":
         cmd_cwd = args.get("cwd")
         if cmd_cwd:
-            _validate_path(cmd_cwd, cwd)
+            try:
+                _validate_path(cmd_cwd, cwd)
+            except ValueError as e:
+                return f"[ERROR] {e}"
         return _run(args["command"], cmd_cwd or cwd)
 
     if name == "ripgrep":
@@ -390,7 +398,11 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
                 ):
                     return f"[ERROR] Blocked dangerous flag: {token}"
                 # Block combined short flags containing 'z' (e.g. -iz, -nz)
-                if token.startswith("-") and not token.startswith("--") and "z" in token:
+                if (
+                    token.startswith("-")
+                    and not token.startswith("--")
+                    and "z" in token
+                ):
                     return f"[ERROR] Blocked dangerous flag: {token} (contains -z)"
             cmd.extend(flag_tokens)
         cmd.append(args["pattern"])
@@ -503,7 +515,9 @@ async def _stream_response(
                 content_parts.append(delta["content"])
 
             for tc in delta.get("tool_calls", []):
-                idx = tc["index"]
+                idx = tc.get("index")
+                if idx is None:
+                    continue
                 if idx not in tool_calls:
                     tool_calls[idx] = {
                         "id": tc.get("id", ""),
@@ -596,6 +610,7 @@ async def agent_loop(
     tools: list[dict],
     cwd: str,
     max_iterations: int,
+    blocked_tools: frozenset[str] = frozenset(),
 ) -> str:
     """Run a tool-calling loop until the model calls done() or stops calling tools."""
 
@@ -659,6 +674,28 @@ async def agent_loop(
                 return result + _format_activity_footer(activity, iteration + 1)
 
             for tc, fn, fn_args in parsed_calls:
+                # Enforce runtime tool allowlist
+                if fn in blocked_tools:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": f"[ERROR] Tool '{fn}' is not allowed in this mode",
+                        }
+                    )
+                    continue
+
+                # Ensure args is a dict (model may return [] or null)
+                if not isinstance(fn_args, dict):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": f"[ERROR] Expected dict arguments, got {type(fn_args).__name__}",
+                        }
+                    )
+                    continue
+
                 activity.append(_activity_entry(fn, fn_args, cwd))
 
                 if fn == "done":
@@ -791,6 +828,7 @@ async def firepass_researcher(
         RESEARCHER_TOOL_DEFS,
         cwd or os.path.expanduser("~"),
         max_iterations,
+        blocked_tools=RESEARCHER_BLOCKED_TOOLS,
     )
 
 
