@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [options]
-exclude-newer = "2026-04-06T18:20:15.200904Z"
+exclude-newer = "2026-04-06T18:44:00.423428Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -233,7 +233,6 @@ wheels = [
 
 [[package]]
 name = "firepass-mcp"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

@@ -317,26 +317,22 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
             p = _validate_path(args["path"], cwd)
             off = max(args.get("offset", 1) - 1, 0)
             lim = args.get("limit")
-            # Read only requested lines to avoid memory exhaustion
             lines = []
             with open(p, "r", encoding="utf-8", errors="replace") as f:
-                if lim is None:
-                    # Read lines with a character budget to avoid loading huge files
+                if lim is not None:
+                    # islice already skips to offset — lines are the final selection
+                    lines = list(islice(f, off, off + lim))
+                else:
+                    # Skip to offset, then read with a character budget
+                    for _ in islice(f, off):
+                        pass
                     total_chars = 0
                     for line in f:
                         lines.append(line)
                         total_chars += len(line)
                         if total_chars > READ_CAP:
                             break
-                else:
-                    # Use islice to read only requested lines
-                    original_offset = off
-                    lines = list(islice(f, off, off + lim))
-                    off = original_offset  # Keep original offset for correct line numbering
-            if lim is None:
-                lim = len(lines)
-            sel = lines[off : off + lim] if lim else lines
-            numbered = [f"{i + off + 1:>6}|{line}" for i, line in enumerate(sel)]
+            numbered = [f"{i + off + 1:>6}|{line}" for i, line in enumerate(lines)]
             return "".join(numbered)[:READ_CAP]
         except Exception as e:
             return f"[ERROR] {e}"
@@ -379,18 +375,23 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
 
     if name == "ripgrep":
         flags = args.get("flags", "")
-        path = args.get("path") or cwd
+        try:
+            path = str(_validate_path(args.get("path") or cwd, cwd))
+        except ValueError as e:
+            return f"[ERROR] {e}"
         # Build command as list to avoid shell injection via flags
         cmd = ["rg", "--no-heading", "-n"]
         if flags:
-            # Split and quote each flag token
             flag_tokens = shlex.split(flags)
-            # Block dangerous flags that could execute code
             for token in flag_tokens:
+                # Block dangerous long flags
                 if token in RIPGREP_BLOCKED_FLAGS or any(
                     token.startswith(f"{blocked}=") for blocked in RIPGREP_BLOCKED_FLAGS
                 ):
                     return f"[ERROR] Blocked dangerous flag: {token}"
+                # Block combined short flags containing 'z' (e.g. -iz, -nz)
+                if token.startswith("-") and not token.startswith("--") and "z" in token:
+                    return f"[ERROR] Blocked dangerous flag: {token} (contains -z)"
             cmd.extend(flag_tokens)
         cmd.append(args["pattern"])
         cmd.append(path)
@@ -410,7 +411,10 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
             return f"[ERROR] {e}"
 
     if name == "ast_grep":
-        path = args.get("path") or cwd
+        try:
+            path = str(_validate_path(args.get("path") or cwd, cwd))
+        except ValueError as e:
+            return f"[ERROR] {e}"
         lang = args.get("lang", "")
         cmd = ["sg", "--pattern", args["pattern"]]
         if lang:
@@ -423,7 +427,11 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
         inp = args.get("input_json")
         expr = args["expression"]
         if f:
-            return _run(["jq", expr, f], cwd)
+            try:
+                validated_f = str(_validate_path(f, cwd))
+            except ValueError as e:
+                return f"[ERROR] {e}"
+            return _run(["jq", expr, validated_f], cwd)
         if inp:
             return _run(f"echo {shlex.quote(inp)} | jq {shlex.quote(expr)}", cwd)
         return "[ERROR] provide file or input_json"
@@ -568,14 +576,15 @@ def _format_activity_footer(activity: list[str], iterations: int) -> str:
 
 def _enforce_context_budget(messages: list[dict]) -> None:
     """Truncate old tool messages if total context exceeds CONTEXT_CAP."""
-    total = len(json.dumps(messages))
+    total = sum(len(msg.get("content", "")) for msg in messages)
     if total <= CONTEXT_CAP:
         return
-    # Truncate content of old tool messages, keeping recent context
+    # Truncate oldest tool messages first, keeping recent context
     for msg in messages:
-        if msg.get("role") == "tool":
+        if msg.get("role") == "tool" and msg["content"] != "[truncated]":
+            freed = len(msg["content"]) - len("[truncated]")
             msg["content"] = "[truncated]"
-            total = len(json.dumps(messages))
+            total -= freed
             if total <= CONTEXT_CAP:
                 break
 
