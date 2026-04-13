@@ -28,6 +28,10 @@ BASH_TIMEOUT = int(os.environ.get("FIREPASS_BASH_TIMEOUT", "60"))
 OUTPUT_CAP = int(os.environ.get("FIREPASS_MAX_OUTPUT", "50000"))
 READ_CAP = int(os.environ.get("FIREPASS_MAX_READ", "100000"))
 WRITE_CAP = 1_000_000  # 1MB max write size
+CONTEXT_CAP = 200_000  # Max characters for message context
+
+# Dangerous ripgrep flags that could allow code execution
+RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip"}
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -276,7 +280,10 @@ RESEARCHER_TOOL_DEFS = [
 
 def _validate_path(path: str, cwd: str) -> Path:
     """Resolve path and verify it doesn't escape the working directory."""
-    resolved = Path(path).resolve()
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(cwd) / p
+    resolved = p.resolve()
     cwd_resolved = Path(cwd).resolve()
     if not resolved.is_relative_to(cwd_resolved):
         raise ValueError(f"Path {path} escapes working directory {cwd}")
@@ -314,12 +321,18 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
             lines = []
             with open(p, "r", encoding="utf-8", errors="replace") as f:
                 if lim is None:
-                    # Read all lines but cap total output
-                    lines = f.readlines()
+                    # Read lines with a character budget to avoid loading huge files
+                    total_chars = 0
+                    for line in f:
+                        lines.append(line)
+                        total_chars += len(line)
+                        if total_chars > READ_CAP:
+                            break
                 else:
                     # Use islice to read only requested lines
+                    original_offset = off
                     lines = list(islice(f, off, off + lim))
-                    off = 0  # Already skipped via islice
+                    off = original_offset  # Keep original offset for correct line numbering
             if lim is None:
                 lim = len(lines)
             sel = lines[off : off + lim] if lim else lines
@@ -359,7 +372,10 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
             return f"[ERROR] {e}"
 
     if name == "bash":
-        return _run(args["command"], args.get("cwd") or cwd)
+        cmd_cwd = args.get("cwd")
+        if cmd_cwd:
+            _validate_path(cmd_cwd, cwd)
+        return _run(args["command"], cmd_cwd or cwd)
 
     if name == "ripgrep":
         flags = args.get("flags", "")
@@ -368,7 +384,14 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
         cmd = ["rg", "--no-heading", "-n"]
         if flags:
             # Split and quote each flag token
-            cmd.extend(shlex.split(flags))
+            flag_tokens = shlex.split(flags)
+            # Block dangerous flags that could execute code
+            for token in flag_tokens:
+                if token in RIPGREP_BLOCKED_FLAGS or any(
+                    token.startswith(f"{blocked}=") for blocked in RIPGREP_BLOCKED_FLAGS
+                ):
+                    return f"[ERROR] Blocked dangerous flag: {token}"
+            cmd.extend(flag_tokens)
         cmd.append(args["pattern"])
         cmd.append(path)
         return _run(cmd, cwd)
@@ -376,7 +399,12 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "glob_find":
         try:
             base = _validate_path(args.get("path") or cwd, cwd)
-            matches = sorted(base.glob(args["pattern"]))
+            cwd_resolved = Path(cwd).resolve()
+            matches = [
+                m
+                for m in sorted(base.glob(args["pattern"]))
+                if m.resolve().is_relative_to(cwd_resolved)
+            ]
             return "\n".join(str(m) for m in matches[:500]) or "(no matches)"
         except Exception as e:
             return f"[ERROR] {e}"
@@ -538,6 +566,20 @@ def _format_activity_footer(activity: list[str], iterations: int) -> str:
     return "\n".join(lines)
 
 
+def _enforce_context_budget(messages: list[dict]) -> None:
+    """Truncate old tool messages if total context exceeds CONTEXT_CAP."""
+    total = len(json.dumps(messages))
+    if total <= CONTEXT_CAP:
+        return
+    # Truncate content of old tool messages, keeping recent context
+    for msg in messages:
+        if msg.get("role") == "tool":
+            msg["content"] = "[truncated]"
+            total = len(json.dumps(messages))
+            if total <= CONTEXT_CAP:
+                break
+
+
 async def agent_loop(
     system: str,
     prompt: str,
@@ -580,32 +622,34 @@ async def agent_loop(
                         "temperature": 0.2,
                     },
                 )
-            except RuntimeError as e:
+            except (RuntimeError, httpx.HTTPError, httpx.StreamError, OSError) as e:
                 return str(e) + _format_activity_footer(activity, iteration + 1)
 
-            messages.append(msg)
-
-            tool_calls = msg.get("tool_calls")
-            if not tool_calls:
-                result = msg.get("content") or "(empty response)"
-                return result + _format_activity_footer(activity, iteration + 1)
-
+            # Validate all tool calls parse correctly before appending assistant message
+            tool_calls = msg.get("tool_calls", [])
+            parse_errors = []
+            parsed_calls = []
             for tc in tool_calls:
                 fn = tc["function"]["name"]
                 try:
                     fn_args = json.loads(tc["function"]["arguments"])
+                    parsed_calls.append((tc, fn, fn_args))
                 except (json.JSONDecodeError, KeyError) as e:
-                    # Report JSON parse error to the model
-                    error_msg = f"[ERROR] Failed to parse tool arguments: {e}"
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.get("id", ""),
-                            "content": error_msg,
-                        }
-                    )
-                    continue
+                    parse_errors.append(f"[ERROR] Failed to parse {fn} arguments: {e}")
 
+            if parse_errors:
+                # Return error without appending malformed assistant message
+                return "\n".join(parse_errors) + _format_activity_footer(
+                    activity, iteration + 1
+                )
+
+            messages.append(msg)
+
+            if not tool_calls:
+                result = msg.get("content") or "(empty response)"
+                return result + _format_activity_footer(activity, iteration + 1)
+
+            for tc, fn, fn_args in parsed_calls:
                 activity.append(_activity_entry(fn, fn_args, cwd))
 
                 if fn == "done":
@@ -620,6 +664,8 @@ async def agent_loop(
                         "content": result,
                     }
                 )
+
+            _enforce_context_budget(messages)
 
     return f"[Hit iteration limit ({max_iterations})]" + _format_activity_footer(
         activity, max_iterations

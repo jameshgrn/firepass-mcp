@@ -13,7 +13,8 @@ Two tools exposed over MCP:
 
 - Python 3.10+
 - A [Fireworks AI](https://fireworks.ai) API key
-- `rg` (ripgrep), `jq`, `tree` on PATH for full tool coverage
+- `rg` (ripgrep), `sg` (ast-grep), `jq`, `tree` on PATH for full tool coverage
+- `bash`, `ls` (standard on POSIX systems)
 
 ## Install
 
