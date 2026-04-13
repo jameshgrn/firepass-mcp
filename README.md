@@ -19,10 +19,6 @@ Two tools exposed over MCP:
 ## Install
 
 ```bash
-# From GitHub (available now)
-uvx --from git+https://github.com/jameshgrn/firepass-mcp firepass-mcp
-
-# From PyPI (once published)
 uvx firepass-mcp
 ```
 
@@ -43,7 +39,7 @@ Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
   "mcpServers": {
     "firepass": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/jameshgrn/firepass-mcp", "firepass-mcp"],
+      "args": ["firepass-mcp"],
       "env": {
         "FIREWORKS_API_KEY": "fw-..."
       }
