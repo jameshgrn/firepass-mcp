@@ -19,11 +19,11 @@ Two tools exposed over MCP:
 ## Install
 
 ```bash
-# uvx (zero-install, recommended)
-uvx firepass-mcp
+# From GitHub (available now)
+uvx --from git+https://github.com/jameshgrn/firepass-mcp firepass-mcp
 
-# or pip
-pip install firepass-mcp
+# From PyPI (once published)
+uvx firepass-mcp
 ```
 
 ## Configuration
@@ -43,7 +43,7 @@ Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
   "mcpServers": {
     "firepass": {
       "command": "uvx",
-      "args": ["firepass-mcp"],
+      "args": ["--from", "git+https://github.com/jameshgrn/firepass-mcp", "firepass-mcp"],
       "env": {
         "FIREWORKS_API_KEY": "fw-..."
       }
@@ -81,6 +81,21 @@ Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
 5. The summary (plus an activity log) is returned as the tool result
 
 The worker gets 50 iterations by default; the researcher gets 30. Both are configurable per call.
+
+## Security model
+
+All file operations (`read_file`, `write_file`, `edit_file`, `glob_find`, `ripgrep`, `ast_grep`, `jq`, `tree`, `list_dir`) are sandboxed to the `cwd` you provide. Paths are resolved and validated against the working directory before any I/O.
+
+The **researcher** is read-only — `bash`, `write_file`, and `edit_file` are blocked both at the API schema level (model never sees them) and at runtime (server rejects them even if hallucinated). Dangerous ripgrep flags (`--pre`, `--replace`, `-z`) are also blocked.
+
+The **worker** has full access including `bash`. It is not sandboxed at the command level — treat it like giving shell access to a remote developer scoped to your project directory.
+
+**Limits:**
+- File writes capped at 1 MB per operation
+- File reads capped at 100K characters
+- Tool output capped at 50K characters
+- Context budget of 200K characters (old tool results truncated when exceeded)
+- Configurable iteration limits (default 50 worker, 30 researcher)
 
 ## License
 
