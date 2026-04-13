@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/jakegearon/firepass-mcp"
+Repository = "https://github.com/jameshgrn/firepass-mcp"
 
 [project.scripts]
 firepass-mcp = "firepass_mcp.server:main"
