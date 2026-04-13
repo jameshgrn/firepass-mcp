@@ -14,19 +14,20 @@ Configuration via environment variables:
 
 import json
 import os
+import shlex
 import subprocess
+from itertools import islice
 from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 API_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
-MODEL = os.environ.get(
-    "FIREPASS_MODEL", "accounts/fireworks/routers/kimi-k2p5-turbo"
-)
+MODEL = os.environ.get("FIREPASS_MODEL", "accounts/fireworks/routers/kimi-k2p5-turbo")
 BASH_TIMEOUT = int(os.environ.get("FIREPASS_BASH_TIMEOUT", "60"))
 OUTPUT_CAP = int(os.environ.get("FIREPASS_MAX_OUTPUT", "50000"))
 READ_CAP = int(os.environ.get("FIREPASS_MAX_READ", "100000"))
+WRITE_CAP = 1_000_000  # 1MB max write size
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -273,9 +274,13 @@ RESEARCHER_TOOL_DEFS = [
 # ---------------------------------------------------------------------------
 
 
-def _sq(s: str) -> str:
-    """Shell-quote a string."""
-    return "'" + s.replace("'", "'\\''") + "'"
+def _validate_path(path: str, cwd: str) -> Path:
+    """Resolve path and verify it doesn't escape the working directory."""
+    resolved = Path(path).resolve()
+    cwd_resolved = Path(cwd).resolve()
+    if not resolved.is_relative_to(cwd_resolved):
+        raise ValueError(f"Path {path} escapes working directory {cwd}")
+    return resolved
 
 
 def _run(cmd: str | list[str], cwd: str) -> str:
@@ -302,28 +307,42 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
 
     if name == "read_file":
         try:
-            text = Path(args["path"]).read_text()
-            lines = text.splitlines(keepends=True)
+            p = _validate_path(args["path"], cwd)
             off = max(args.get("offset", 1) - 1, 0)
-            lim = args.get("limit") or len(lines)
-            sel = lines[off : off + lim]
-            numbered = [f"{i + off + 1:>6}|{l}" for i, l in enumerate(sel)]
+            lim = args.get("limit")
+            # Read only requested lines to avoid memory exhaustion
+            lines = []
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                if lim is None:
+                    # Read all lines but cap total output
+                    lines = f.readlines()
+                else:
+                    # Use islice to read only requested lines
+                    lines = list(islice(f, off, off + lim))
+                    off = 0  # Already skipped via islice
+            if lim is None:
+                lim = len(lines)
+            sel = lines[off : off + lim] if lim else lines
+            numbered = [f"{i + off + 1:>6}|{line}" for i, line in enumerate(sel)]
             return "".join(numbered)[:READ_CAP]
         except Exception as e:
             return f"[ERROR] {e}"
 
     if name == "write_file":
         try:
-            p = Path(args["path"])
+            content = args["content"]
+            if len(content) > WRITE_CAP:
+                return f"[ERROR] Content size ({len(content)} bytes) exceeds maximum allowed ({WRITE_CAP} bytes)"
+            p = _validate_path(args["path"], cwd)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(args["content"])
-            return f"Wrote {len(args['content'])} bytes to {args['path']}"
+            p.write_text(content)
+            return f"Wrote {len(content)} bytes to {args['path']}"
         except Exception as e:
             return f"[ERROR] {e}"
 
     if name == "edit_file":
         try:
-            p = Path(args["path"])
+            p = _validate_path(args["path"], cwd)
             content = p.read_text()
             old = args["old_text"]
             count = content.count(old)
@@ -345,13 +364,18 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "ripgrep":
         flags = args.get("flags", "")
         path = args.get("path") or cwd
-        return _run(
-            f"rg --no-heading -n {flags} {_sq(args['pattern'])} {_sq(path)}", cwd
-        )
+        # Build command as list to avoid shell injection via flags
+        cmd = ["rg", "--no-heading", "-n"]
+        if flags:
+            # Split and quote each flag token
+            cmd.extend(shlex.split(flags))
+        cmd.append(args["pattern"])
+        cmd.append(path)
+        return _run(cmd, cwd)
 
     if name == "glob_find":
         try:
-            base = Path(args.get("path") or cwd)
+            base = _validate_path(args.get("path") or cwd, cwd)
             matches = sorted(base.glob(args["pattern"]))
             return "\n".join(str(m) for m in matches[:500]) or "(no matches)"
         except Exception as e:
@@ -360,10 +384,10 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
     if name == "ast_grep":
         path = args.get("path") or cwd
         lang = args.get("lang", "")
-        cmd = f"sg --pattern {_sq(args['pattern'])}"
+        cmd = ["sg", "--pattern", args["pattern"]]
         if lang:
-            cmd += f" --lang {lang}"
-        cmd += f" {_sq(path)}"
+            cmd.extend(["--lang", lang])
+        cmd.append(path)
         return _run(cmd, cwd)
 
     if name == "jq":
@@ -371,28 +395,35 @@ def exec_tool(name: str, args: dict, cwd: str) -> str:
         inp = args.get("input_json")
         expr = args["expression"]
         if f:
-            return _run(f"jq {_sq(expr)} {_sq(f)}", cwd)
+            return _run(["jq", expr, f], cwd)
         if inp:
-            return _run(f"echo {_sq(inp)} | jq {_sq(expr)}", cwd)
+            return _run(f"echo {shlex.quote(inp)} | jq {shlex.quote(expr)}", cwd)
         return "[ERROR] provide file or input_json"
 
     if name == "list_dir":
-        return _run(["ls", "-lah", args.get("path") or cwd], cwd)
+        try:
+            path = _validate_path(args.get("path") or cwd, cwd)
+            return _run(["ls", "-lah", str(path)], cwd)
+        except Exception as e:
+            return f"[ERROR] {e}"
 
     if name == "tree":
-        path = args.get("path") or cwd
-        depth = str(args.get("max_depth", 3))
-        return _run(
-            [
-                "tree",
-                "-L",
-                depth,
-                "-I",
-                "__pycache__|.git|node_modules|.venv|.mypy_cache",
-                path,
-            ],
-            cwd,
-        )
+        try:
+            path = _validate_path(args.get("path") or cwd, cwd)
+            depth = str(args.get("max_depth", 3))
+            return _run(
+                [
+                    "tree",
+                    "-L",
+                    depth,
+                    "-I",
+                    "__pycache__|.git|node_modules|.venv|.mypy_cache",
+                    str(path),
+                ],
+                cwd,
+            )
+        except Exception as e:
+            return f"[ERROR] {e}"
 
     if name == "done":
         return args.get("result", "Done.")
@@ -535,9 +566,9 @@ async def agent_loop(
 
     activity: list[str] = []
 
-    for iteration in range(max_iterations):
-        try:
-            async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
+        for iteration in range(max_iterations):
+            try:
                 msg = await _stream_response(
                     client,
                     headers,
@@ -549,33 +580,46 @@ async def agent_loop(
                         "temperature": 0.2,
                     },
                 )
-        except RuntimeError as e:
-            return str(e) + _format_activity_footer(activity, iteration + 1)
+            except RuntimeError as e:
+                return str(e) + _format_activity_footer(activity, iteration + 1)
 
-        messages.append(msg)
+            messages.append(msg)
 
-        tool_calls = msg.get("tool_calls")
-        if not tool_calls:
-            result = msg.get("content") or "(empty response)"
-            return result + _format_activity_footer(activity, iteration + 1)
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                result = msg.get("content") or "(empty response)"
+                return result + _format_activity_footer(activity, iteration + 1)
 
-        for tc in tool_calls:
-            fn = tc["function"]["name"]
-            try:
-                fn_args = json.loads(tc["function"]["arguments"])
-            except (json.JSONDecodeError, KeyError):
-                fn_args = {}
+            for tc in tool_calls:
+                fn = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError) as e:
+                    # Report JSON parse error to the model
+                    error_msg = f"[ERROR] Failed to parse tool arguments: {e}"
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": error_msg,
+                        }
+                    )
+                    continue
 
-            activity.append(_activity_entry(fn, fn_args, cwd))
+                activity.append(_activity_entry(fn, fn_args, cwd))
 
-            if fn == "done":
-                summary = fn_args.get("result", msg.get("content", "Done."))
-                return summary + _format_activity_footer(activity, iteration + 1)
+                if fn == "done":
+                    summary = fn_args.get("result", msg.get("content", "Done."))
+                    return summary + _format_activity_footer(activity, iteration + 1)
 
-            result = exec_tool(fn, fn_args, cwd)
-            messages.append(
-                {"role": "tool", "tool_call_id": tc["id"], "content": result}
-            )
+                result = exec_tool(fn, fn_args, cwd)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": result,
+                    }
+                )
 
     return f"[Hit iteration limit ({max_iterations})]" + _format_activity_footer(
         activity, max_iterations
