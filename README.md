@@ -2,12 +2,13 @@
 
 MCP server that turns [Kimi K2.5 Turbo](https://fireworks.ai) into an agentic coding assistant. The model gets a tool loop — it can read/write files, run shell commands, and search code with ripgrep, ast-grep, jq, and glob — and iterates autonomously until the task is done.
 
-Two tools exposed over MCP:
+Three tools exposed over MCP:
 
 | Tool | Capabilities | Use case |
 |------|-------------|----------|
 | `firepass_worker` | read, write, edit, bash, ripgrep, ast-grep, jq, glob, tree | Coding, refactoring, bug fixes |
 | `firepass_researcher` | read, ripgrep, ast-grep, jq, glob, tree (read-only) | Code analysis, architecture review |
+| `firepass_reviewer` | read, ripgrep, ast-grep, jq, glob, tree (read-only) | Code review with structured output |
 
 ## Requirements
 
@@ -30,9 +31,53 @@ Set your API key:
 export FIREWORKS_API_KEY="fw-..."
 ```
 
-### Claude Code / Claude Desktop
+### Codex CLI
 
-Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
+Add the server with:
+
+```bash
+codex mcp add firepass --env FIREWORKS_API_KEY=fw-... -- uv run firepass-mcp
+```
+
+This writes a config like:
+
+```toml
+[mcp_servers.firepass]
+command = "uv"
+args = ["run", "firepass-mcp"]
+
+[mcp_servers.firepass.env]
+FIREWORKS_API_KEY = "fw-..."
+```
+
+### Claude Code
+
+Add the server with:
+
+```bash
+claude mcp add -e FIREWORKS_API_KEY=fw-... firepass -- uv run firepass-mcp
+```
+
+This writes a config like:
+
+```json
+{
+  "mcpServers": {
+    "firepass": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "firepass-mcp"],
+      "env": {
+        "FIREWORKS_API_KEY": "fw-..."
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop / Generic MCP JSON
+
+If your client reads MCP JSON directly, use:
 
 ```json
 {
@@ -44,16 +89,6 @@ Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
         "FIREWORKS_API_KEY": "fw-..."
       }
     }
-  }
-}
-```
-
-### Any MCP client
-
-```json
-{
-  "firepass": {
-    "command": "firepass-mcp"
   }
 }
 ```
@@ -70,19 +105,19 @@ Add to your MCP config (`~/.mcp.json` or Claude Desktop settings):
 
 ## How it works
 
-1. You call `firepass_worker` or `firepass_researcher` with a prompt and working directory
+1. You call `firepass_worker`, `firepass_researcher`, or `firepass_reviewer` with a prompt and a required `cwd`
 2. The server sends the prompt to Kimi K2.5 Turbo with function-calling enabled
 3. The model explores the codebase, makes edits, runs tests, and iterates
 4. When done, it calls `done()` with an executive summary
 5. The summary (plus an activity log) is returned as the tool result
 
-The worker gets 50 iterations by default; the researcher gets 30. Both are configurable per call.
+All roles get 60 iterations by default, configurable per call.
 
 ## Security model
 
-All file operations (`read_file`, `write_file`, `edit_file`, `glob_find`, `ripgrep`, `ast_grep`, `jq`, `tree`, `list_dir`) are sandboxed to the `cwd` you provide. Paths are resolved and validated against the working directory before any I/O.
+All file operations (`read_file`, `write_file`, `edit_file`, `glob_find`, `ripgrep`, `ast_grep`, `jq`, `tree`, `list_dir`) are sandboxed to the required `cwd` you provide. Paths are resolved and validated against the working directory before any I/O.
 
-The **researcher** is read-only — `bash`, `write_file`, and `edit_file` are blocked both at the API schema level (model never sees them) and at runtime (server rejects them even if hallucinated). Dangerous ripgrep flags (`--pre`, `--replace`, `-z`) are also blocked.
+The **researcher** and **reviewer** are read-only — `bash`, `write_file`, and `edit_file` are blocked both at the API schema level (model never sees them) and at runtime (server rejects them even if hallucinated). Dangerous ripgrep flags (`--pre`, `--replace`, `-z`) are also blocked.
 
 The **worker** has full access including `bash`. It is not sandboxed at the command level — treat it like giving shell access to a remote developer scoped to your project directory.
 
@@ -91,7 +126,7 @@ The **worker** has full access including `bash`. It is not sandboxed at the comm
 - File reads capped at 100K characters
 - Tool output capped at 50K characters
 - Context budget of 200K characters (old tool results truncated when exceeded)
-- Configurable iteration limits (default 50 worker, 30 researcher)
+- Configurable iteration limits (default 60 for all roles)
 
 ## License
 

@@ -18,6 +18,7 @@ import shlex
 import subprocess
 from itertools import islice
 from pathlib import Path
+from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -37,7 +38,9 @@ RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip", "--replace
 # Tool definitions (OpenAI function-calling format)
 # ---------------------------------------------------------------------------
 
-TOOL_DEFS = [
+ToolDef = dict[str, Any]
+
+TOOL_DEFS: list[ToolDef] = [
     {
         "type": "function",
         "function": {
@@ -266,10 +269,10 @@ TOOL_DEFS = [
     },
 ]
 
-# Researcher: no write_file, edit_file, or bash
-RESEARCHER_BLOCKED_TOOLS = frozenset({"write_file", "edit_file", "bash"})
-RESEARCHER_TOOL_DEFS = [
-    t for t in TOOL_DEFS if t["function"]["name"] not in RESEARCHER_BLOCKED_TOOLS
+# Read-only roles: no write_file, edit_file, or bash
+READONLY_BLOCKED_TOOLS = frozenset({"write_file", "edit_file", "bash"})
+READONLY_TOOL_DEFS = [
+    t for t in TOOL_DEFS if t["function"]["name"] not in READONLY_BLOCKED_TOOLS
 ]
 
 # ---------------------------------------------------------------------------
@@ -287,6 +290,19 @@ def _validate_path(path: str, cwd: str) -> Path:
     if not resolved.is_relative_to(cwd_resolved):
         raise ValueError(f"Path {path} escapes working directory {cwd}")
     return resolved
+
+
+def _normalize_cwd(cwd: str) -> str:
+    """Require an existing directory and normalize it to an absolute path."""
+    if not cwd:
+        raise ValueError("cwd is required")
+
+    resolved = Path(cwd).expanduser().resolve()
+    if not resolved.exists():
+        raise ValueError(f"Working directory does not exist: {cwd}")
+    if not resolved.is_dir():
+        raise ValueError(f"Working directory is not a directory: {cwd}")
+    return str(resolved)
 
 
 def _run(cmd: str | list[str], cwd: str) -> str:
@@ -768,6 +784,38 @@ Your done() result is returned to a supervising agent. Keep it to a ONE PAGE \
 executive summary: key findings, file locations, conclusions. No full file dumps — \
 cite file:line references. The supervisor can read the files itself."""
 
+REVIEWER_SYSTEM = """\
+You are a senior code reviewer inside a read-only agent harness.
+You have tools to read files, search code with ripgrep/ast-grep/jq/glob, \
+list directories, and view directory trees.
+You CANNOT write, edit files, or run shell commands.
+
+Workflow:
+1. Orient — use tree/list_dir/glob to understand project structure
+2. Read the files or diff under review
+3. Search for related code — callers, tests, type definitions, similar patterns
+4. Evaluate in order: correctness → security → architecture → performance → style
+5. Call done(result="...") with your review
+
+Rules:
+- Every issue must cite file:line and explain *why* it matters
+- Distinguish blocking issues from nits — label severity (bug, security, design, nit)
+- Suggest concrete fixes, not vague complaints
+- Acknowledge what's done well — don't only list problems
+- Check for: error handling gaps, missing edge cases, resource leaks, \
+race conditions, injection vectors, API misuse
+- If tests exist, verify they cover the changed code paths
+
+Output:
+Your done() result is returned to a supervising agent. Structure it as:
+
+**Summary**: 1-2 sentence overall assessment.
+**Blocking**: Issues that must be fixed (bug, security, correctness).
+**Suggestions**: Non-blocking improvements (design, performance, style).
+**Good**: What's done well.
+
+Cite file:line for every item. No full code dumps."""
+
 # ---------------------------------------------------------------------------
 # MCP entry points
 # ---------------------------------------------------------------------------
@@ -778,9 +826,9 @@ mcp = FastMCP("firepass-mcp")
 @mcp.tool()
 async def firepass_worker(
     prompt: str,
-    cwd: str = "",
+    cwd: str,
     context: str = "",
-    max_iterations: int = 50,
+    max_iterations: int = 60,
 ) -> str:
     """Run a coding task with FirePass worker (Kimi K2.5 Turbo + tool loop).
 
@@ -789,16 +837,17 @@ async def firepass_worker(
 
     Args:
         prompt: The coding task.
-        cwd: Working directory (default: home).
+        cwd: Working directory to sandbox file access to.
         context: Optional file contents, errors, or specs to pre-load.
         max_iterations: Max tool-call rounds (default 50).
     """
+    normalized_cwd = _normalize_cwd(cwd)
     return await agent_loop(
         WORKER_SYSTEM,
         prompt,
         context or None,
         TOOL_DEFS,
-        cwd or os.path.expanduser("~"),
+        normalized_cwd,
         max_iterations,
     )
 
@@ -806,9 +855,9 @@ async def firepass_worker(
 @mcp.tool()
 async def firepass_researcher(
     prompt: str,
-    cwd: str = "",
+    cwd: str,
     context: str = "",
-    max_iterations: int = 30,
+    max_iterations: int = 60,
 ) -> str:
     """Run a research task with FirePass researcher (Kimi K2.5 Turbo + read-only tool loop).
 
@@ -817,18 +866,50 @@ async def firepass_researcher(
 
     Args:
         prompt: Research question or analysis task.
-        cwd: Working directory (default: home).
+        cwd: Working directory to sandbox file access to.
         context: Optional file contents, docs, or code to pre-load.
         max_iterations: Max tool-call rounds (default 30).
     """
+    normalized_cwd = _normalize_cwd(cwd)
     return await agent_loop(
         RESEARCHER_SYSTEM,
         prompt,
         context or None,
-        RESEARCHER_TOOL_DEFS,
-        cwd or os.path.expanduser("~"),
+        READONLY_TOOL_DEFS,
+        normalized_cwd,
         max_iterations,
-        blocked_tools=RESEARCHER_BLOCKED_TOOLS,
+        blocked_tools=READONLY_BLOCKED_TOOLS,
+    )
+
+
+@mcp.tool()
+async def firepass_reviewer(
+    prompt: str,
+    cwd: str,
+    context: str = "",
+    max_iterations: int = 60,
+) -> str:
+    """Run a code review with FirePass reviewer (Kimi K2.5 Turbo + read-only tool loop).
+
+    The reviewer can read files, search with ripgrep/ast-grep/jq/glob,
+    and iterate autonomously. No file writes or shell commands.
+    Returns structured review: blocking issues, suggestions, and what's done well.
+
+    Args:
+        prompt: What to review — files, a diff, a PR description, or a specific concern.
+        cwd: Working directory to sandbox file access to.
+        context: Optional diff, file contents, or PR description to pre-load.
+        max_iterations: Max tool-call rounds (default 30).
+    """
+    normalized_cwd = _normalize_cwd(cwd)
+    return await agent_loop(
+        REVIEWER_SYSTEM,
+        prompt,
+        context or None,
+        READONLY_TOOL_DEFS,
+        normalized_cwd,
+        max_iterations,
+        blocked_tools=READONLY_BLOCKED_TOOLS,
     )
 
 
