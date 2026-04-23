@@ -839,7 +839,7 @@ async def firepass_worker(
         prompt: The coding task.
         cwd: Working directory to sandbox file access to.
         context: Optional file contents, errors, or specs to pre-load.
-        max_iterations: Max tool-call rounds (default 50).
+        max_iterations: Max tool-call rounds (default 60).
     """
     normalized_cwd = _normalize_cwd(cwd)
     return await agent_loop(
@@ -868,7 +868,7 @@ async def firepass_researcher(
         prompt: Research question or analysis task.
         cwd: Working directory to sandbox file access to.
         context: Optional file contents, docs, or code to pre-load.
-        max_iterations: Max tool-call rounds (default 30).
+        max_iterations: Max tool-call rounds (default 60).
     """
     normalized_cwd = _normalize_cwd(cwd)
     return await agent_loop(
@@ -899,7 +899,7 @@ async def firepass_reviewer(
         prompt: What to review — files, a diff, a PR description, or a specific concern.
         cwd: Working directory to sandbox file access to.
         context: Optional diff, file contents, or PR description to pre-load.
-        max_iterations: Max tool-call rounds (default 30).
+        max_iterations: Max tool-call rounds (default 60).
     """
     normalized_cwd = _normalize_cwd(cwd)
     return await agent_loop(
