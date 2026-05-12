@@ -1,7 +1,7 @@
 ---
 name: firepass-reviewer
 description: |
-  Delegate code review tasks to FirePass (Kimi K2.5 Turbo via Fireworks AI).
+  Delegate code review tasks to FirePass (Kimi K2.6 Turbo via Fireworks AI).
   The reviewer has a read-only tool loop and returns structured review output:
   blocking issues, suggestions, and what's done well. Use for code review,
   PR review, or architecture review.
@@ -11,7 +11,7 @@ version: 1.0.0
 
 # FirePass Reviewer
 
-Autonomous code reviewer powered by Kimi K2.5 Turbo. Has its own read-only tool
+Autonomous code reviewer powered by Kimi K2.6 Turbo. Has its own read-only tool
 loop with: read_file, ripgrep, ast_grep, jq, glob_find, tree, list_dir.
 Returns structured review: blocking issues, suggestions, and what's done well.
 

@@ -1,7 +1,7 @@
 ---
 name: firepass-worker
 description: |
-  Delegate coding/implementation tasks to FirePass (Kimi K2.5 Turbo via Fireworks AI).
+  Delegate coding/implementation tasks to FirePass (Kimi K2.6 Turbo via Fireworks AI).
   The worker has its own tool loop — it can read/write/edit files, run bash, search
   with ripgrep/ast-grep/jq, and iterate autonomously. Use INSTEAD OF default Agent
   subagents for coding work.
@@ -11,7 +11,7 @@ version: 2.1.0
 
 # FirePass Worker
 
-Autonomous coding agent powered by Kimi K2.5 Turbo. Has its own tool loop with:
+Autonomous coding agent powered by Kimi K2.6 Turbo. Has its own tool loop with:
 read_file, write_file, edit_file, bash, ripgrep, ast_grep, jq, glob_find, tree, list_dir.
 
 ## When to use

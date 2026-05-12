@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "firepass-mcp"
 dynamic = ["version"]
-description = "MCP server that wraps Kimi K2.5 Turbo (Fireworks AI) as an agentic coding assistant with a full tool loop."
+description = "MCP server that wraps Kimi K2.6 Turbo (Fireworks AI) as an agentic coding assistant with a full tool loop."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

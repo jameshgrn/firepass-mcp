@@ -1,7 +1,7 @@
 ---
 name: firepass-researcher
 description: |
-  Delegate research/analysis tasks to FirePass (Kimi K2.5 Turbo via Fireworks AI).
+  Delegate research/analysis tasks to FirePass (Kimi K2.6 Turbo via Fireworks AI).
   The researcher has a read-only tool loop — it can read files, search with
   ripgrep/ast-grep/jq/glob, and iterate autonomously. No writes or shell commands.
   Use INSTEAD OF default Agent subagents for research work.
@@ -11,7 +11,7 @@ version: 2.1.0
 
 # FirePass Researcher
 
-Autonomous read-only research agent powered by Kimi K2.5 Turbo. Has its own tool
+Autonomous read-only research agent powered by Kimi K2.6 Turbo. Has its own tool
 loop with: read_file, ripgrep, ast_grep, jq, glob_find, tree, list_dir.
 No write_file, edit_file, or bash — cannot mutate anything.
 

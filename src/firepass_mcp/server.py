@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""FirePass MCP Server — Agentic coding harness for Kimi K2.5 Turbo via Fireworks AI.
+"""FirePass MCP Server — Agentic coding harness for Kimi K2.6 Turbo via Fireworks AI.
 
 Gives the model a tool loop so it can read/write files, run commands, and search code
 autonomously until the task is done.
 
 Configuration via environment variables:
     FIREWORKS_API_KEY  — Required. Your Fireworks AI API key.
-    FIREPASS_MODEL     — Model ID (default: accounts/fireworks/routers/kimi-k2p5-turbo).
+    FIREPASS_MODEL     — Model ID (default: accounts/fireworks/routers/kimi-k2p6-turbo).
     FIREPASS_BASH_TIMEOUT — Shell command timeout in seconds (default: 60).
     FIREPASS_MAX_OUTPUT   — Max chars per tool result (default: 50000).
     FIREPASS_MAX_READ     — Max chars per file read (default: 100000).
@@ -24,7 +24,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 API_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
-MODEL = os.environ.get("FIREPASS_MODEL", "accounts/fireworks/routers/kimi-k2p5-turbo")
+MODEL = os.environ.get("FIREPASS_MODEL", "accounts/fireworks/routers/kimi-k2p6-turbo")
 BASH_TIMEOUT = int(os.environ.get("FIREPASS_BASH_TIMEOUT", "60"))
 OUTPUT_CAP = int(os.environ.get("FIREPASS_MAX_OUTPUT", "50000"))
 READ_CAP = int(os.environ.get("FIREPASS_MAX_READ", "100000"))
@@ -830,7 +830,7 @@ async def firepass_worker(
     context: str = "",
     max_iterations: int = 60,
 ) -> str:
-    """Run a coding task with FirePass worker (Kimi K2.5 Turbo + tool loop).
+    """Run a coding task with FirePass worker (Kimi K2.6 Turbo + tool loop).
 
     The worker can read/write/edit files, run bash, search with ripgrep/ast-grep/jq,
     and iterate autonomously until done.
@@ -859,7 +859,7 @@ async def firepass_researcher(
     context: str = "",
     max_iterations: int = 60,
 ) -> str:
-    """Run a research task with FirePass researcher (Kimi K2.5 Turbo + read-only tool loop).
+    """Run a research task with FirePass researcher (Kimi K2.6 Turbo + read-only tool loop).
 
     The researcher can read files, search with ripgrep/ast-grep/jq/glob,
     and iterate autonomously. No file writes or shell commands.
@@ -889,7 +889,7 @@ async def firepass_reviewer(
     context: str = "",
     max_iterations: int = 60,
 ) -> str:
-    """Run a code review with FirePass reviewer (Kimi K2.5 Turbo + read-only tool loop).
+    """Run a code review with FirePass reviewer (Kimi K2.6 Turbo + read-only tool loop).
 
     The reviewer can read files, search with ripgrep/ast-grep/jq/glob,
     and iterate autonomously. No file writes or shell commands.
