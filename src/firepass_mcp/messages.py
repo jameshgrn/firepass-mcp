@@ -50,17 +50,21 @@ def _compact_tool_calls(msg: dict) -> tuple[dict, int]:
     return compacted, freed
 
 
-def _enforce_context_budget(messages: list[dict]) -> list[dict]:
+def enforce_context_budget(messages: list[dict]) -> list[dict]:
     """Return messages compacted to fit the context budget.
 
     Tool outputs and assistant tool-call arguments are replay evidence, so they
     can be compacted. System/user/assistant text is not blindly truncated because
     that would alter the actual task or model response.
     """
-    compacted_messages = [_copy_message(msg) for msg in messages]
-    total = sum(_message_size(msg) for msg in compacted_messages)
+    total = sum(_message_size(msg) for msg in messages)
     if total <= CONTEXT_CAP:
-        return compacted_messages
+        # Under budget: skip the deep-copy. agent_loop calls this every iteration,
+        # so cloning a 60-message transcript when nothing needs compacting is pure
+        # waste.
+        return messages
+
+    compacted_messages = [_copy_message(msg) for msg in messages]
 
     # Phase 1: truncate oldest tool messages first
     for msg in compacted_messages:
@@ -123,6 +127,11 @@ def parse_tool_calls(raw_tool_calls: object) -> tuple[list[ParsedToolCall], list
                 f"[ERROR] Malformed tool call {index}: function arguments must be a JSON string"
             )
             continue
+
+        # OpenAI streaming aggregates argument deltas into a single string and
+        # leaves it empty for tool calls with no arguments. Treat that as {}.
+        if raw_args == "":
+            raw_args = "{}"
 
         try:
             arguments = json.loads(raw_args)

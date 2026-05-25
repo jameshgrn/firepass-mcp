@@ -19,17 +19,17 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from firepass_mcp.messages import (
-    _enforce_context_budget,
+    enforce_context_budget,
     parse_tool_calls,
 )
 from firepass_mcp.tools import (
     READONLY_BLOCKED_TOOLS,
     READONLY_TOOL_DEFS,
     TOOL_DEFS,
-    _clamp_max_iterations,
-    _normalize_cwd,
+    clamp_max_iterations,
     exec_tool,
     format_tool_activity,
+    normalize_cwd,
     readonly_tool_names,
     tool_names,
 )
@@ -152,7 +152,7 @@ async def agent_loop(
     async with httpx.AsyncClient(timeout=300) as client:
         for iteration in range(max_iterations):
             try:
-                messages = _enforce_context_budget(messages)
+                messages = enforce_context_budget(messages)
             except ValueError as e:
                 return f"[ERROR] {e}" + _format_activity_footer(activity, iteration + 1)
 
@@ -213,11 +213,6 @@ async def agent_loop(
                         "content": result,
                     }
                 )
-
-            try:
-                messages = _enforce_context_budget(messages)
-            except ValueError as e:
-                return f"[ERROR] {e}" + _format_activity_footer(activity, iteration + 1)
 
     return f"[Hit iteration limit ({max_iterations})]" + _format_activity_footer(
         activity, max_iterations
@@ -331,8 +326,8 @@ async def firepass_worker(
         context: Optional file contents, errors, or specs to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
-    clamped_iterations = _clamp_max_iterations(max_iterations)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         WORKER_SYSTEM,
         prompt,
@@ -361,8 +356,8 @@ async def firepass_researcher(
         context: Optional file contents, docs, or code to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
-    clamped_iterations = _clamp_max_iterations(max_iterations)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         RESEARCHER_SYSTEM,
         prompt,
@@ -393,8 +388,8 @@ async def firepass_reviewer(
         context: Optional diff, file contents, or PR description to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
-    clamped_iterations = _clamp_max_iterations(max_iterations)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         REVIEWER_SYSTEM,
         prompt,

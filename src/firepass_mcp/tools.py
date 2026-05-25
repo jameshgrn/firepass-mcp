@@ -1,7 +1,5 @@
 """Tool schemas and local tool execution for FirePass."""
 
-from __future__ import annotations
-
 import os
 import shlex
 import subprocess
@@ -301,7 +299,7 @@ def _validate_path(path: str, cwd: str) -> Path:
     return resolved
 
 
-def _normalize_cwd(cwd: str) -> str:
+def normalize_cwd(cwd: str) -> str:
     """Require an existing directory and normalize it to an absolute path."""
     if not cwd:
         raise ValueError("cwd is required")
@@ -314,7 +312,7 @@ def _normalize_cwd(cwd: str) -> str:
     return str(resolved)
 
 
-def _clamp_max_iterations(value: int) -> int:
+def clamp_max_iterations(value: int) -> int:
     """Validate and clamp max_iterations to a safe range."""
     if value <= 0:
         raise ValueError(f"max_iterations must be > 0, got {value}")
@@ -426,7 +424,7 @@ def _run_edit_file(args: EditFileArgs, cwd: str) -> str:
         return f"[ERROR] old_text not found in {args.path}"
     if count > 1:
         return (
-            f"[ERROR] old_text matches {count} locations - "
+            f"[ERROR] old_text matches {count} locations — "
             "must match exactly once. Add more surrounding context."
         )
 
