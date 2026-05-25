@@ -31,3 +31,8 @@ firepass-mcp = "firepass_mcp.server:main"
 
 [tool.hatch.version]
 path = "src/firepass_mcp/__init__.py"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
