@@ -129,19 +129,35 @@ def _xml_envelope(status: str, iterations: int, activity: list[str], body: str) 
 
 
 def _retag_envelope(xml: str, new_tag: str) -> str:
-    """Rename the outermost XML open/close tags to new_tag."""
-    start = xml.find("<")
-    if start == -1 or xml[start + 1] == "/":
+    """Rename the outermost XML open/close tags to new_tag.
+
+    Envelopes produced by `_xml_envelope` are anchored: the open tag
+    starts at index 0, and the close tag ends at the final character.
+    Body content is escaped via `_xml_escape`, so any occurrence of the
+    old tag name inside the body has its `<` and `>` already turned
+    into `&lt;` and `&gt;` — only the outer pair remains as raw tag
+    boundaries. We rely on those two anchors instead of a substring
+    `.replace()`, which would happen to work today but could match a
+    body-text occurrence of the literal tag name if escaping were ever
+    skipped or relaxed.
+    """
+    if not xml.startswith("<"):
         return xml
-    space = xml.find(" ", start)
-    gt = xml.find(">", start)
-    end = space if space != -1 and (gt == -1 or space < gt) else gt
-    if end == -1:
+
+    # Read the open tag name: stops at the first space, slash, or '>'.
+    cursor = 1
+    while cursor < len(xml) and xml[cursor] not in (" ", ">", "/", "\t", "\n"):
+        cursor += 1
+    old_tag = xml[1:cursor]
+    if not old_tag:
         return xml
-    old_tag = xml[start + 1 : end]
-    xml = xml.replace(f"<{old_tag}", f"<{new_tag}", 1)
-    xml = xml.replace(f"</{old_tag}>", f"</{new_tag}>", 1)
-    return xml
+
+    close_marker = f"</{old_tag}>"
+    if not xml.endswith(close_marker):
+        return xml
+
+    head = f"<{new_tag}" + xml[cursor : len(xml) - len(close_marker)]
+    return head + f"</{new_tag}>"
 
 
 async def agent_loop(

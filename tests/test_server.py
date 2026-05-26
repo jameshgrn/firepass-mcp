@@ -14,6 +14,7 @@ from firepass_mcp.messages import (
     parse_tool_calls,
 )
 from firepass_mcp.server import (
+    _retag_envelope,
     _stream_response,
     agent_loop,
     firepass_researcher,
@@ -939,3 +940,134 @@ def test_firepass_trio_research_failure_short_circuits(monkeypatch, tmp_path):
     assert 'rounds="0"' in result
     assert call_counts["researcher"] == 1
     assert call_counts["worker"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 14. firepass_trio — single-round boundary (max_review_rounds=1)
+# ---------------------------------------------------------------------------
+
+
+def test_firepass_trio_max_review_rounds_one_then_needs_fixes(monkeypatch, tmp_path):
+    """With max_review_rounds=1 and a perpetually NEEDS-FIXES reviewer, the trio
+    runs exactly one worker+review pair, then exits with needs_fixes. There must
+    be no second worker call — the cap is the cap, not the cap-plus-one."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return (
+            '<firepass_researcher status="completed" iterations="1" tool_calls="0">'
+            "<result>findings</result><activity></activity></firepass_researcher>"
+        )
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        return (
+            '<firepass_worker status="completed" iterations="1" tool_calls="0">'
+            "<result>code</result><activity></activity></firepass_worker>"
+        )
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        return (
+            '<firepass_reviewer status="completed" iterations="1" tool_calls="0">'
+            "<result>NEEDS-FIXES</result><activity></activity></firepass_reviewer>"
+        )
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=1))
+
+    assert 'status="needs_fixes"' in result
+    assert 'rounds="1"' in result
+    assert result.count("<round ") == 1
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 1
+    assert call_counts["reviewer"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 15. _retag_envelope — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_retag_envelope_preserves_attributes():
+    """The attribute list on the open tag must survive the rename."""
+    src = (
+        '<firepass_run status="completed" iterations="3" tool_calls="2">\n'
+        "<result>body</result>\n<activity></activity>\n</firepass_run>"
+    )
+    out = _retag_envelope(src, "firepass_worker")
+    assert out.startswith(
+        '<firepass_worker status="completed" iterations="3" tool_calls="2">'
+    )
+    assert out.endswith("</firepass_worker>")
+    # The interior is byte-identical.
+    assert "<result>body</result>" in out
+    assert "<activity></activity>" in out
+
+
+def test_retag_envelope_ignores_old_tag_name_in_body_text():
+    """If the body text contains the literal old tag name as plain text (Kimi
+    mentioning the function name in prose), the rename must NOT rewrite it.
+    Only the outer open + close pair are anchored boundaries."""
+    src = (
+        '<firepass_worker status="completed" iterations="1" tool_calls="0">\n'
+        "<result>I called firepass_worker to do the thing</result>\n"
+        "<activity></activity>\n"
+        "</firepass_worker>"
+    )
+    out = _retag_envelope(src, "implementation")
+    assert out.startswith("<implementation ")
+    assert out.endswith("</implementation>")
+    # The plain-text mention is preserved verbatim — exactly one un-renamed
+    # occurrence remains in the body.
+    assert "I called firepass_worker to do the thing" in out
+    # And exactly one open and one close after the rename, anchored at the ends.
+    assert out.count("<implementation ") == 1
+    assert out.count("</implementation>") == 1
+
+
+def test_retag_envelope_idempotent_when_new_tag_equals_old():
+    src = (
+        '<firepass_run status="completed" iterations="0" tool_calls="0">\n'
+        "<result>x</result>\n<activity></activity>\n</firepass_run>"
+    )
+    assert _retag_envelope(src, "firepass_run") == src
+
+
+def test_retag_envelope_returns_unchanged_on_malformed_input():
+    """Non-XML input or input that doesn't end in the matching close tag is
+    passed through untouched. Defensive fallback, not a real code path."""
+    assert _retag_envelope("not xml at all", "anything") == "not xml at all"
+    assert _retag_envelope("", "anything") == ""
+    # Has an open tag but no matching close — pass through.
+    assert _retag_envelope("<firepass_run>orphan", "x") == "<firepass_run>orphan"
+    # Wrong close tag — pass through.
+    assert (
+        _retag_envelope("<firepass_run>body</different>", "x")
+        == "<firepass_run>body</different>"
+    )
+
+
+def test_retag_envelope_handles_open_tag_with_no_attributes():
+    """Open tag may end at '>' directly with no attributes — still rename it."""
+    src = "<firepass_run>\n<result>x</result>\n</firepass_run>"
+    out = _retag_envelope(src, "review")
+    assert out == "<review>\n<result>x</result>\n</review>"
+
+
+def test_retag_envelope_anchors_open_tag_at_position_zero():
+    """If escaping were ever skipped and the body contained an unescaped
+    `<firepass_run` substring, a naive `.replace(<firepass_run, <X, 1)`
+    would silently mangle the body. We anchor at position 0 instead so
+    only the outer open tag is renamed."""
+    # Body deliberately contains a raw `<firepass_run` to defeat the naive
+    # first-occurrence replace. This shape can't arise through `_xml_escape`,
+    # but the anchoring is what makes that guarantee robust.
+    src = "<firepass_run>body has a stray <firepass_run literal</firepass_run>"
+    out = _retag_envelope(src, "implementation")
+    # Outer tags renamed; the stray substring in the body is left alone.
+    assert out == "<implementation>body has a stray <firepass_run literal</implementation>"
