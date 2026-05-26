@@ -14,6 +14,7 @@ OUTPUT_CAP = int(os.environ.get("FIREPASS_MAX_OUTPUT", "50000"))
 READ_CAP = int(os.environ.get("FIREPASS_MAX_READ", "100000"))
 WRITE_CAP = 1_000_000  # 1MB max write size
 MAX_ITERATIONS_LIMIT = 200  # Hard ceiling for user-supplied max_iterations
+MAX_REVIEW_ROUNDS_LIMIT = 5  # Hard ceiling for user-supplied max_review_rounds
 GLOB_RESULT_CAP = 500
 
 RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip", "--replace", "-r"}
@@ -318,6 +319,15 @@ def clamp_max_iterations(value: int) -> int:
         raise ValueError(f"max_iterations must be > 0, got {value}")
     if value > MAX_ITERATIONS_LIMIT:
         return MAX_ITERATIONS_LIMIT
+    return value
+
+
+def clamp_max_review_rounds(value: int) -> int:
+    """Validate and clamp max_review_rounds to a safe range."""
+    if value <= 0:
+        raise ValueError(f"max_review_rounds must be > 0, got {value}")
+    if value > MAX_REVIEW_ROUNDS_LIMIT:
+        return MAX_REVIEW_ROUNDS_LIMIT
     return value
 
 

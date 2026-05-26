@@ -27,6 +27,7 @@ from firepass_mcp.tools import (
     READONLY_TOOL_DEFS,
     TOOL_DEFS,
     clamp_max_iterations,
+    clamp_max_review_rounds,
     exec_tool,
     format_tool_activity,
     normalize_cwd,
@@ -128,9 +129,18 @@ def _xml_envelope(status: str, iterations: int, activity: list[str], body: str) 
 
 
 def _retag_envelope(xml: str, new_tag: str) -> str:
-    """Rename the outermost firepass_run open/close tags to new_tag."""
-    xml = xml.replace("<firepass_run", f"<{new_tag}", 1)
-    xml = xml.replace("</firepass_run>", f"</{new_tag}>", 1)
+    """Rename the outermost XML open/close tags to new_tag."""
+    start = xml.find("<")
+    if start == -1 or xml[start + 1] == "/":
+        return xml
+    space = xml.find(" ", start)
+    gt = xml.find(">", start)
+    end = space if space != -1 and (gt == -1 or space < gt) else gt
+    if end == -1:
+        return xml
+    old_tag = xml[start + 1 : end]
+    xml = xml.replace(f"<{old_tag}", f"<{new_tag}", 1)
+    xml = xml.replace(f"</{old_tag}>", f"</{new_tag}>", 1)
     return xml
 
 
@@ -429,6 +439,114 @@ async def firepass_reviewer(
         blocked_tools=READONLY_BLOCKED_TOOLS,
     )
     return _retag_envelope(result, "firepass_reviewer")
+
+
+def _build_trio_response(
+    status: str, rounds: int, research_xml: str, rounds_xml: list[str]
+) -> str:
+    lines = [
+        f'<firepass_trio status="{status}" rounds="{rounds}">',
+        _retag_envelope(research_xml, "research"),
+        "<rounds>",
+    ]
+    lines.extend(rounds_xml)
+    lines.append("</rounds>")
+    lines.append("</firepass_trio>")
+    return "\n".join(lines)
+
+
+async def _run_trio_chain(
+    prompt: str,
+    cwd: str,
+    context: str,
+    max_iterations: int,
+    max_review_rounds: int,
+) -> str:
+    """Orchestrate researcher → worker → reviewer with optional fix loops."""
+    # 1. Researcher
+    research_xml = await firepass_researcher(
+        prompt, cwd, context, max_iterations=max_iterations
+    )
+    if 'status="completed"' not in research_xml:
+        return _build_trio_response("research_failed", 0, research_xml, [])
+
+    # 2. First implementation
+    worker_context = research_xml
+    impl_xml = await firepass_worker(
+        prompt, cwd, worker_context, max_iterations=max_iterations
+    )
+    if 'status="completed"' not in impl_xml:
+        return _build_trio_response("implementation_failed", 0, research_xml, [])
+
+    # 3. Review loop
+    rounds_xml: list[str] = []
+    rounds_used = 0
+
+    while True:
+        review_xml = await firepass_reviewer(
+            prompt, cwd, impl_xml, max_iterations=max_iterations
+        )
+        rounds_used += 1
+
+        round_xml = (
+            f'<round n="{rounds_used}">\n'
+            f"{_retag_envelope(impl_xml, 'implementation')}\n"
+            f"{_retag_envelope(review_xml, 'review')}\n"
+            f"</round>"
+        )
+        rounds_xml.append(round_xml)
+
+        if 'status="completed"' not in review_xml:
+            return _build_trio_response(
+                "review_failed", rounds_used, research_xml, rounds_xml
+            )
+
+        if "NEEDS-FIXES" not in review_xml or rounds_used >= max_review_rounds:
+            status = (
+                "needs_fixes"
+                if ("NEEDS-FIXES" in review_xml and rounds_used >= max_review_rounds)
+                else "approved"
+            )
+            return _build_trio_response(status, rounds_used, research_xml, rounds_xml)
+
+        # Next round: append reviewer feedback to context and re-run worker
+        worker_context = f"{worker_context}\n\nReviewer feedback:\n{review_xml}"
+        impl_xml = await firepass_worker(
+            prompt, cwd, worker_context, max_iterations=max_iterations
+        )
+        if 'status="completed"' not in impl_xml:
+            return _build_trio_response(
+                "implementation_failed", rounds_used, research_xml, rounds_xml
+            )
+
+
+@mcp.tool()
+async def firepass_trio(
+    prompt: str,
+    cwd: str,
+    context: str = "",
+    max_iterations: int = 60,
+    max_review_rounds: int = 2,
+) -> str:
+    """Run a full FirePass trio: research → implement → review → (fix loop).
+
+    Args:
+        prompt: The coding task.
+        cwd: Working directory to sandbox file access to.
+        context: Optional file contents, errors, or specs to pre-load.
+        max_iterations: Max tool-call rounds per sub-agent (default 60).
+        max_review_rounds: Max worker+reviewer fix rounds (default 2).
+    """
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
+    clamped_rounds = clamp_max_review_rounds(max_review_rounds)
+    return await _run_trio_chain(
+        prompt,
+        normalized_cwd,
+        context,
+        clamped_iterations,
+        clamped_rounds,
+    )
 
 
 def main():

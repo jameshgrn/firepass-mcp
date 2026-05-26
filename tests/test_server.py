@@ -18,14 +18,17 @@ from firepass_mcp.server import (
     agent_loop,
     firepass_researcher,
     firepass_reviewer,
+    firepass_trio,
     firepass_worker,
 )
 from firepass_mcp.tools import (
     MAX_ITERATIONS_LIMIT,
+    MAX_REVIEW_ROUNDS_LIMIT,
     READONLY_BLOCKED_TOOLS,
     READONLY_TOOL_DEFS,
     _validate_path,
     clamp_max_iterations,
+    clamp_max_review_rounds,
     exec_tool,
     normalize_cwd,
 )
@@ -755,3 +758,184 @@ def test_xml_envelope_status_tool_call_parse_error(monkeypatch, tmp_path):
     assert 'status="tool_call_parse_error"' in result
     assert "tool call" in result
     assert "function" in result
+
+
+# ---------------------------------------------------------------------------
+# 11. clamp_max_review_rounds helper
+# ---------------------------------------------------------------------------
+
+
+def test_clamp_max_review_rounds_helper():
+    assert clamp_max_review_rounds(1) == 1
+    assert clamp_max_review_rounds(2) == 2
+    assert clamp_max_review_rounds(MAX_REVIEW_ROUNDS_LIMIT) == MAX_REVIEW_ROUNDS_LIMIT
+    with pytest.raises(ValueError, match="must be > 0"):
+        clamp_max_review_rounds(-1)
+    with pytest.raises(ValueError, match="must be > 0"):
+        clamp_max_review_rounds(0)
+    assert clamp_max_review_rounds(999_999) == MAX_REVIEW_ROUNDS_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# 12. firepass_trio orchestration
+# ---------------------------------------------------------------------------
+
+
+def test_firepass_trio_approve_first_round(monkeypatch, tmp_path):
+    """All sub-calls succeed immediately; trio status is approved with one round."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>findings</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path)))
+
+    assert 'status="approved"' in result
+    assert 'rounds="1"' in result
+    assert result.count("<round ") == 1
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 1
+    assert call_counts["reviewer"] == 1
+    assert "<research " in result
+    assert "<implementation " in result
+    assert "<review " in result
+
+
+def test_firepass_trio_loops_on_needs_fixes_then_approves(monkeypatch, tmp_path):
+    """First reviewer says NEEDS-FIXES, second says APPROVE; two rounds, worker gets feedback."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+    worker_contexts: list[str] = []
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>findings</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        worker_contexts.append(context)
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    reviewer_calls = [0]
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        reviewer_calls[0] += 1
+        if reviewer_calls[0] == 1:
+            return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>NEEDS-FIXES: fix X</result><activity></activity></firepass_reviewer>'
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=3))
+
+    assert 'status="approved"' in result
+    assert 'rounds="2"' in result
+    assert result.count("<round ") == 2
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 2
+    assert call_counts["reviewer"] == 2
+    # Second worker invocation must include the first reviewer's feedback in context
+    assert "NEEDS-FIXES: fix X" in worker_contexts[1]
+
+
+def test_firepass_trio_exhausts_rounds(monkeypatch, tmp_path):
+    """Reviewer always returns NEEDS-FIXES; trio exhausts max_review_rounds."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>findings</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>NEEDS-FIXES</result><activity></activity></firepass_reviewer>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=2))
+
+    assert 'status="needs_fixes"' in result
+    assert 'rounds="2"' in result
+    assert result.count("<round ") == 2
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 2
+    assert call_counts["reviewer"] == 2
+
+
+def test_firepass_trio_clamps_max_review_rounds(monkeypatch, tmp_path):
+    """max_review_rounds above the ceiling is clamped to MAX_REVIEW_ROUNDS_LIMIT."""
+    recorded = {}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>findings</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+
+    async def fake_run_trio_chain(
+        prompt, cwd, context, max_iterations, max_review_rounds
+    ):
+        recorded["max_review_rounds"] = max_review_rounds
+        return '<firepass_trio status="approved" rounds="1"><research></research><rounds></rounds></firepass_trio>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+    monkeypatch.setattr("firepass_mcp.server._run_trio_chain", fake_run_trio_chain)
+
+    asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=99))
+
+    assert recorded["max_review_rounds"] == MAX_REVIEW_ROUNDS_LIMIT
+
+
+def test_firepass_trio_rejects_zero_review_rounds(monkeypatch, tmp_path):
+    """max_review_rounds=0 must raise ValueError, matching iteration clamp behavior."""
+    with pytest.raises(ValueError, match="must be > 0"):
+        asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=0))
+
+
+def test_firepass_trio_research_failure_short_circuits(monkeypatch, tmp_path):
+    """If researcher fails, trio status is research_failed and worker is never called."""
+    call_counts = {"researcher": 0, "worker": 0}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="api_error" iterations="0" tool_calls="0"><result>fail</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path)))
+
+    assert 'status="research_failed"' in result
+    assert 'rounds="0"' in result
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 0
