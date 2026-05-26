@@ -41,12 +41,11 @@ Spec — what `firepass_trio` does:
     * `\"review_failed\"` — reviewer returned non-completed status
 - Each nested `<research>`, `<implementation>`, `<review>` envelope is
   exactly the string already produced by the corresponding sub-call
-  (worker/researcher/reviewer), inlined verbatim. Do NOT re-wrap; do
-  NOT re-escape — those calls already escape their own bodies. Trim
-  the outer `<firepass_worker>`/`<firepass_researcher>`/
-  `<firepass_reviewer>` tags but keep their attributes and inner
-  content; rename to `<research>`/`<implementation>`/`<review>` for
-  inside the trio envelope. Helper function `_rewrap_envelope` is fine.
+  (worker/researcher/reviewer), with its outer tag renamed. Reuse the
+  existing `_retag_envelope(xml, new_tag)` helper added in the
+  xml-envelope task — pass `\"research\"`, `\"implementation\"`,
+  or `\"review\"`. Do NOT re-escape the bodies; the sub-calls already
+  escape them.
 - Both `max_iterations` and `max_review_rounds` are clamped:
     * `max_iterations`: existing `clamp_max_iterations`.
     * `max_review_rounds`: new `clamp_max_review_rounds` in tools.py
@@ -59,20 +58,20 @@ Edit:
    - Add `clamp_max_review_rounds(value: int) -> int` mirroring
      `clamp_max_iterations`.
 2. `src/firepass_mcp/server.py`:
-   - Add `_rewrap_envelope(envelope: str, new_tag: str) -> str` that
-     swaps the outer tag (`<firepass_worker ...>...</firepass_worker>`
-     → `<implementation ...>...</implementation>`). Keep attributes.
    - Add `firepass_trio` as a new `@mcp.tool()`.
    - Internal `_run_trio_chain` async helper does the orchestration so
-     `firepass_trio` itself is a thin wrapper that just clamps inputs.
-   - The trio envelope uses `_xml_envelope` with `tool_name=\"firepass_trio\"`,
-     status per spec above. The body is constructed from the rewrapped
-     sub-envelopes (no `<result>` wrapper for the trio — its body IS
-     the structured rounds).
-3. Helper: extract the body-and-attrs from a sub-envelope without
-   reparsing XML. Since the wrapping helper produces a known shape, a
-   small string-slicing function is enough; do NOT pull in lxml or
-   ElementTree.
+     `firepass_trio` itself is a thin wrapper that clamps inputs and
+     delegates.
+   - The trio assembles its own envelope WITHOUT `_xml_envelope`
+     (whose `<result>` shape doesn't fit). Build the outer string
+     directly:
+       `<firepass_trio status=\"...\" rounds=\"N\">\\n<research ...>...</research>\\n<rounds>\\n<round n=\"1\">\\n<implementation ...>...</implementation>\\n<review ...>...</review>\\n</round>\\n...\\n</rounds>\\n</firepass_trio>`
+     The `<research>`, `<implementation>`, and `<review>` blocks come
+     from `_retag_envelope` applied to the worker/researcher/reviewer
+     return values. Attribute values on the trio root are integers and
+     do not need escaping.
+   - DO NOT modify `_xml_envelope` itself. DO NOT modify any of the
+     three existing wrappers' signatures or decorators.
 
 Tests — add to `tests/test_server.py`:
 - `test_firepass_trio_approve_first_round` — monkeypatch the three sub

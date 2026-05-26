@@ -32,30 +32,55 @@ Context — what changes:
   tag. Iteration count and tool-call count move to attributes on the
   root tag (no duplicate plaintext line inside).
 
+Important architectural constraint:
+- DO NOT change the signature of `agent_loop`. dgov settlement has a
+  signature_drift gate; adding parameters to that function will be
+  rejected. Instead, `agent_loop` always emits envelopes with the
+  default root tag `<firepass_run>`. The three MCP wrappers
+  post-process the returned string to rename the outer tag.
+
 Edit:
-1. In `src/firepass_mcp/server.py`, add a small helper module-private
-   function `_xml_envelope(tool_name, status, iterations, activity, body)`
-   that returns the wrapped string. Replace `_format_activity_footer`
-   with the new helper; delete the old one — no shim, no dual format.
-2. Wire every return path in `agent_loop` through `_xml_envelope` with
-   the correct status code. Cover: API error, context overflow, tool-call
-   parse error, `done()` completion, plain-text completion (model
-   returns content with no tool calls), iteration-limit hit.
-3. The root tag name is taken from a new `tool_name` parameter on
-   `agent_loop` (string). The three wrappers (`firepass_worker`,
-   `firepass_researcher`, `firepass_reviewer`) pass their own name.
-   Default `tool_name` is the empty string → root tag falls back to
-   `<firepass_run>` for callers that don't supply one.
-4. XML-escape the activity entries and the result body (`&` `<` `>` only;
-   the helper should call a single function — write a tiny `_xml_escape`
-   helper too). The activity strings come from `format_tool_activity`
-   and may contain user paths with `<` `>` in rare cases; escape them.
+1. In `src/firepass_mcp/server.py`, add three small module-private
+   helpers in this order, replacing `_format_activity_footer`:
+   - `_xml_escape(s)` — escape `&`, `<`, `>` (in that order). Three
+     replaces, no html lib.
+   - `_xml_envelope(status, iterations, activity, body)` — return the
+     wrapped string with the hardcoded root tag `firepass_run`. Shape:
+       `<firepass_run status=\"X\" iterations=\"N\" tool_calls=\"M\">\\n<result>...</result>\\n<activity>\\n<call>...</call>\\n...\\n</activity>\\n</firepass_run>`
+     `activity` is a list[str]; map each through `_xml_escape` and
+     wrap in `<call>...</call>`. `body` goes through `_xml_escape`
+     before being placed inside `<result>...</result>`. Iteration
+     count and tool-call count are attribute values on the root.
+   - `_retag_envelope(xml, new_tag)` — rename the outermost
+     `firepass_run` open/close tags to `new_tag`. Pure string slicing:
+     find the literal `<firepass_run` and `</firepass_run>` substrings
+     and replace both (the open form preserves attributes after the
+     tag name, so only the substring `firepass_run` is swapped, not
+     the full open tag). Single replacement of each, not global.
+2. Replace `_format_activity_footer` with `_xml_envelope` at every
+   return point in `agent_loop`. Keep `agent_loop`'s signature
+   exactly as it was on main (no new params). Cover six return paths:
+   - context overflow (top-of-iteration `enforce_context_budget`
+     raised): `status=\"context_overflow\"`
+   - API/streaming error from `_stream_response`: `status=\"api_error\"`
+   - `parse_tool_calls` returned errors: `status=\"tool_call_parse_error\"`
+   - model returned content with no tool_calls (plain completion):
+     `status=\"completed\"`
+   - `done()` tool call: `status=\"completed\"`
+   - iteration limit exhausted: `status=\"max_iterations\"`
+3. In each of the three MCP wrappers (`firepass_worker`,
+   `firepass_researcher`, `firepass_reviewer`), capture the
+   `agent_loop` return value into a variable, then return
+   `_retag_envelope(value, \"firepass_worker\")` (or `_firepass_researcher`
+   / `_firepass_reviewer`). Do not modify the wrappers'
+   signatures or decorators.
 
 Tests — add to `tests/test_server.py`:
-- `test_xml_envelope_wraps_done_result` — drive `agent_loop` to a
-  successful `done()` and assert the return value starts with
+- `test_xml_envelope_wraps_done_result` — call `firepass_worker`
+  end-to-end with a mocked `_stream_response` that emits a `done()`;
+  assert the returned string starts with
   `<firepass_worker status=\"completed\"` and contains
-  `<result>` and `</firepass_worker>`.
+  `<result>` and ends with `</firepass_worker>`.
 - `test_xml_envelope_escapes_result_body` — feed a Kimi-result with `<`
   and `&` characters; assert they are escaped in the `<result>` block.
 - `test_xml_envelope_status_max_iterations` — exhaust iterations,
