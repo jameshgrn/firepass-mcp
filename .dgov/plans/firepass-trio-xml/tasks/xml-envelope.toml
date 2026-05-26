@@ -1,0 +1,94 @@
+[tasks.xml-envelope]
+summary = "Wrap all four MCP tool returns in an XML envelope for the calling LLM to parse."
+prompt = """
+Orient:
+- Read `src/firepass_mcp/server.py` end-to-end. The current return path
+  is `_format_activity_footer` + concatenation in `agent_loop` and the
+  three MCP tool wrappers (`firepass_worker`, `firepass_researcher`,
+  `firepass_reviewer`).
+- Read `src/firepass_mcp/tools.py` to understand `tool_names()` and
+  `format_tool_activity` — those produce the activity list.
+- Read `tests/test_server.py` to see what currently asserts about output
+  format (currently the activity footer is plain text).
+
+Context — what changes:
+- Current return string is a Kimi-generated result body followed by:
+    `\\n\\n--- ACTIVITY LOG ---\\nIterations: N  |  Tool calls: M\\n<bullets>\\n--- END ---`
+- New return string wraps the same content in XML so the calling LLM
+  can address each section:
+    `<firepass_worker status=\"...\" iterations=\"N\" tool_calls=\"M\">\\n<result>...body...</result>\\n<activity>\\n<call>[edit] /path</call>\\n...\\n</activity>\\n</firepass_worker>`
+- The root tag name is the MCP tool name (worker / researcher /
+  reviewer). For the trio (added in a later task), the root will be
+  `<firepass_trio>` with nested sub-envelopes per round.
+- Status values:
+    * `\"completed\"` — model called `done()`
+    * `\"max_iterations\"` — loop exhausted without `done()`
+    * `\"api_error\"` — Fireworks API or streaming error
+    * `\"context_overflow\"` — `enforce_context_budget` raised
+    * `\"tool_call_parse_error\"` — `parse_tool_calls` returned errors
+- The `<result>` body is the same Kimi-generated content as today.
+  Do NOT alter what Kimi writes; only the wrapper changes.
+- `<activity>` carries the existing activity bullets, one per `<call>`
+  tag. Iteration count and tool-call count move to attributes on the
+  root tag (no duplicate plaintext line inside).
+
+Edit:
+1. In `src/firepass_mcp/server.py`, add a small helper module-private
+   function `_xml_envelope(tool_name, status, iterations, activity, body)`
+   that returns the wrapped string. Replace `_format_activity_footer`
+   with the new helper; delete the old one — no shim, no dual format.
+2. Wire every return path in `agent_loop` through `_xml_envelope` with
+   the correct status code. Cover: API error, context overflow, tool-call
+   parse error, `done()` completion, plain-text completion (model
+   returns content with no tool calls), iteration-limit hit.
+3. The root tag name is taken from a new `tool_name` parameter on
+   `agent_loop` (string). The three wrappers (`firepass_worker`,
+   `firepass_researcher`, `firepass_reviewer`) pass their own name.
+   Default `tool_name` is the empty string → root tag falls back to
+   `<firepass_run>` for callers that don't supply one.
+4. XML-escape the activity entries and the result body (`&` `<` `>` only;
+   the helper should call a single function — write a tiny `_xml_escape`
+   helper too). The activity strings come from `format_tool_activity`
+   and may contain user paths with `<` `>` in rare cases; escape them.
+
+Tests — add to `tests/test_server.py`:
+- `test_xml_envelope_wraps_done_result` — drive `agent_loop` to a
+  successful `done()` and assert the return value starts with
+  `<firepass_worker status=\"completed\"` and contains
+  `<result>` and `</firepass_worker>`.
+- `test_xml_envelope_escapes_result_body` — feed a Kimi-result with `<`
+  and `&` characters; assert they are escaped in the `<result>` block.
+- `test_xml_envelope_status_max_iterations` — exhaust iterations,
+  assert `status=\"max_iterations\"`.
+- `test_xml_envelope_status_api_error` — make `_stream_response` raise
+  `RuntimeError`, assert `status=\"api_error\"`.
+- `test_xml_envelope_status_context_overflow` — pass an oversize
+  system prompt, assert `status=\"context_overflow\"`.
+- `test_xml_envelope_status_tool_call_parse_error` — emit a malformed
+  tool_call shape, assert `status=\"tool_call_parse_error\"`.
+- Update any existing test that pattern-matches the old
+  `--- ACTIVITY LOG ---` footer to match the new XML form.
+
+Out of scope:
+- Do NOT add `firepass_trio` here. Separate task.
+- Do NOT touch `README.md` — that lives in a later task.
+- Do NOT introduce new dependencies.
+
+Verify:
+- `uv run pytest -q tests/test_server.py`
+- `uv run ruff check src tests`
+- `uv run ruff format --check src tests`
+- `uv run ty check src`
+"""
+commit_message = "Wrap MCP tool returns in XML envelope"
+role = "worker"
+files.edit = [
+  "src/firepass_mcp/server.py",
+  "tests/test_server.py",
+]
+files.read = [
+  "src/firepass_mcp/tools.py",
+  "src/firepass_mcp/messages.py",
+]
+test_cmd = "uv run pytest -q tests/test_server.py"
+verify = "standard"

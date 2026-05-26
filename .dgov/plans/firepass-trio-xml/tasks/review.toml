@@ -1,0 +1,48 @@
+[tasks.review]
+summary = "Review the full XML-envelope + firepass_trio change set."
+prompt = """
+Orient:
+- The dependency diff is auto-generated from the upstream tasks. Bound
+  the review to that diff plus the files those tasks claim.
+- Acceptance gates already passed: pytest, ruff, ruff format, ty all
+  green per the verify recipe.
+
+Edit:
+- Reviewer only. No file edits.
+
+Review focus (in priority order):
+1. **Envelope shape correctness** — is the XML well-formed under all
+   six status branches (completed / max_iterations / api_error /
+   context_overflow / tool_call_parse_error / done)? Are attribute
+   values escaped? Is the `<activity>` block ordered chronologically?
+2. **Trio loop-back semantics** — does the worker actually receive
+   the reviewer's findings as context on the second pass, or just a
+   re-issued original prompt? Verify by reading
+   `_run_trio_chain` and the matching test.
+3. **`_rewrap_envelope` correctness** — string-slicing-based tag
+   rename. Does it survive multi-line content, nested tags inside the
+   body, attribute values containing `>` (should be escaped), and the
+   absence of attributes? If brittle, propose a fix; do not apply.
+4. **Status taxonomy** — are the seven statuses (six single-tool +
+   trio's `approved`/`needs_fixes`/`research_failed`/etc.) used
+   consistently? Any silent fallthrough that hides errors as
+   `completed`?
+5. **Test coverage** — is `max_review_rounds=1` behavior tested? Is the
+   case where researcher returns a non-completed envelope tested? Is
+   the loop-back-then-approve path tested?
+6. **API surface drift** — did the three existing MCP tools gain
+   parameters they shouldn't have? `firepass_worker`'s signature must
+   stay (`prompt, cwd, context=\"\", max_iterations=60`).
+7. **README** — does the documented envelope shape match what the
+   code emits? Any drift?
+
+Output structure for the `done()` body:
+- `VERIFIED`: claims confirmed (file:line each)
+- `BLOCKING`: bugs that would justify a revert (file:line + repro)
+- `SUGGESTIONS`: non-blocking improvements
+- `VERDICT`: APPROVE / NEEDS-FIXES
+
+Under 700 words.
+"""
+role = "reviewer"
+depends_on = ["tasks/xml-envelope.xml-envelope", "tasks/trio.trio", "tasks/docs.docs"]

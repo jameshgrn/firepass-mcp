@@ -1,0 +1,49 @@
+[tasks.docs]
+summary = "Document firepass_trio and the XML envelope in README.md."
+prompt = """
+Orient:
+- Read `README.md` after the prior tasks landed.
+- Read `src/firepass_mcp/server.py` to confirm the final
+  `firepass_trio` signature and the exact XML envelope shape.
+
+Edit:
+1. Tools table at the top: add a fourth row for `firepass_trio` listing
+   its capabilities (chain of researcher + worker + reviewer with
+   bounded loop-back) and a representative use case
+   (\"Plan-then-implement-then-review in one MCP call\").
+2. In the \"How it works\" section, add a short paragraph after the
+   existing numbered list describing the trio:
+   - One sentence on what it does
+   - One sentence on `max_review_rounds` (default 2, capped at 5)
+   - One sentence saying the response is an XML envelope so the
+     calling LLM can address each sub-result
+3. Add a new \"Response format\" subsection (or extend an existing one
+   if it fits cleanly) that shows the actual XML shape with one
+   compact example each for a single-tool call and for a trio call.
+   Use fenced code blocks. Keep examples short — 10–15 lines per
+   block max.
+4. In the Limits bullets, add: \"Review rounds capped at 5 in the trio
+   (default 2)\".
+
+Hard rules:
+- Tone: factual. No `robust`, `powerful`, `elegant`, `seamless`,
+  `comprehensive`, `critical`, `crucial`, `ensures`.
+- Replace text in place. Do not stack \"but actually\" clauses.
+- Do not add badges, emoji, or links to nonexistent pages.
+
+Verify:
+- `uv run pytest -q tests/test_server.py`  (sanity: doc task should
+  not break tests)
+- `uv run ruff check src tests`
+- `uv run ruff format --check src tests`
+"""
+commit_message = "Document firepass_trio and XML response envelope"
+role = "worker"
+depends_on = ["tasks/trio.trio"]
+files.edit = ["README.md"]
+files.read = [
+  "src/firepass_mcp/server.py",
+  "src/firepass_mcp/tools.py",
+  "tests/test_server.py",
+]
+verify = "standard"

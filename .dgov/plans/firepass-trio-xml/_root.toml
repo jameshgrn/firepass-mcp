@@ -1,0 +1,13 @@
+[plan]
+name = "firepass-trio-xml"
+summary = "Add firepass_trio MCP tool with reviewer loop-back; switch all four MCP tools to XML-wrapped structured output."
+sections = ["tasks"]
+
+# Standard verify recipe for any task touching src/firepass_mcp/ or tests/.
+[verify.standard]
+cmds = [
+  "uv run pytest -q tests/test_server.py",
+  "uv run ruff check src tests",
+  "uv run ruff format --check src tests",
+  "uv run ty check src",
+]
