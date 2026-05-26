@@ -192,7 +192,7 @@ def test_agent_loop_reports_malformed_tool_call_shape(monkeypatch, tmp_path):
         )
     )
 
-    assert result.startswith("[ERROR]")
+    assert 'status="tool_call_parse_error"' in result
     assert "tool call" in result
     assert "function" in result
 
@@ -587,3 +587,171 @@ def test_enforce_context_budget_skips_copy_when_under_cap():
     ]
     result = enforce_context_budget(messages)
     assert result is messages
+
+
+# ---------------------------------------------------------------------------
+# 10. XML envelope formatting
+# ---------------------------------------------------------------------------
+
+
+def test_xml_envelope_wraps_done_result(monkeypatch, tmp_path):
+    """End-to-end through firepass_worker: done() yields a wrapped XML envelope."""
+
+    async def fake_stream_response(client, headers, payload):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "done",
+                        "arguments": '{"result": "All done"}',
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+
+    result = asyncio.run(firepass_worker("task", str(tmp_path), max_iterations=1))
+
+    assert result.startswith('<firepass_worker status="completed"')
+    assert "<result>" in result
+    assert result.endswith("</firepass_worker>")
+
+
+def test_xml_envelope_escapes_result_body(monkeypatch, tmp_path):
+    """Special XML characters in the model-generated body must be escaped."""
+
+    async def fake_stream_response(client, headers, payload):
+        return {"role": "assistant", "content": "Use <div> & enjoy"}
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+
+    result = asyncio.run(
+        agent_loop(
+            system="system",
+            prompt="task",
+            context=None,
+            tools=[],
+            cwd=str(tmp_path),
+            max_iterations=1,
+        )
+    )
+
+    assert "<result>Use &lt;div&gt; &amp; enjoy</result>" in result
+    assert "<firepass_run" in result
+
+
+def test_xml_envelope_status_max_iterations(monkeypatch, tmp_path):
+    """When the loop exhausts max_iterations, status='max_iterations'."""
+
+    async def fake_stream_response(client, headers, payload):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": '{"command": "echo hi"}',
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+    monkeypatch.setattr("firepass_mcp.server.exec_tool", lambda name, args, cwd: "ok")
+
+    result = asyncio.run(
+        agent_loop(
+            system="system",
+            prompt="task",
+            context=None,
+            tools=[],
+            cwd=str(tmp_path),
+            max_iterations=1,
+        )
+    )
+
+    assert 'status="max_iterations"' in result
+
+
+def test_xml_envelope_status_api_error(monkeypatch, tmp_path):
+    """When _stream_response raises, status='api_error'."""
+
+    async def fake_stream_response(client, headers, payload):
+        raise RuntimeError("[API ERROR 500] service unavailable")
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+
+    result = asyncio.run(
+        agent_loop(
+            system="system",
+            prompt="task",
+            context=None,
+            tools=[],
+            cwd=str(tmp_path),
+            max_iterations=1,
+        )
+    )
+
+    assert 'status="api_error"' in result
+
+
+def test_xml_envelope_status_context_overflow(monkeypatch, tmp_path):
+    """When enforce_context_budget raises, status='context_overflow'."""
+
+    async def fake_stream_response(client, headers, payload):
+        return {"role": "assistant", "content": "ok"}
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+
+    huge_system = "x" * 500_000
+
+    result = asyncio.run(
+        agent_loop(
+            system=huge_system,
+            prompt="task",
+            context=None,
+            tools=[],
+            cwd=str(tmp_path),
+            max_iterations=1,
+        )
+    )
+
+    assert 'status="context_overflow"' in result
+
+
+def test_xml_envelope_status_tool_call_parse_error(monkeypatch, tmp_path):
+    """Malformed tool_call shapes yield status='tool_call_parse_error'."""
+
+    async def fake_stream_response(client, headers, payload):
+        return {"role": "assistant", "tool_calls": [{"id": "tc1"}]}
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr("firepass_mcp.server._stream_response", fake_stream_response)
+
+    result = asyncio.run(
+        agent_loop(
+            system="system",
+            prompt="task",
+            context=None,
+            tools=[],
+            cwd=str(tmp_path),
+            max_iterations=1,
+        )
+    )
+
+    assert 'status="tool_call_parse_error"' in result
+    assert "tool call" in result
+    assert "function" in result

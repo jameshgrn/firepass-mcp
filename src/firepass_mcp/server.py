@@ -105,19 +105,33 @@ async def _stream_response(
     return msg
 
 
-def _format_activity_footer(activity: list[str], iterations: int) -> str:
-    """Build the structured activity footer appended to done() results."""
-    if not activity:
-        return ""
+def _xml_escape(s: str) -> str:
+    """Escape &, <, > for XML (in that order)."""
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;")
+    s = s.replace(">", "&gt;")
+    return s
+
+
+def _xml_envelope(status: str, iterations: int, activity: list[str], body: str) -> str:
+    """Wrap a result body and activity list in a firepass_run XML envelope."""
     lines = [
-        "",
-        "--- ACTIVITY LOG ---",
-        f"Iterations: {iterations}  |  Tool calls: {len(activity)}",
+        f'<firepass_run status="{status}" iterations="{iterations}" tool_calls="{len(activity)}">',
+        f"<result>{_xml_escape(body)}</result>",
+        "<activity>",
     ]
     for entry in activity:
-        lines.append(entry)
-    lines.append("--- END ---")
+        lines.append(f"<call>{_xml_escape(entry)}</call>")
+    lines.append("</activity>")
+    lines.append("</firepass_run>")
     return "\n".join(lines)
+
+
+def _retag_envelope(xml: str, new_tag: str) -> str:
+    """Rename the outermost firepass_run open/close tags to new_tag."""
+    xml = xml.replace("<firepass_run", f"<{new_tag}", 1)
+    xml = xml.replace("</firepass_run>", f"</{new_tag}>", 1)
+    return xml
 
 
 async def agent_loop(
@@ -138,23 +152,30 @@ async def agent_loop(
     user_msg += f"\n\nWorking directory: {cwd}"
     messages.append({"role": "user", "content": user_msg})
 
+    activity: list[str] = []
+
     api_key = os.environ.get("FIREWORKS_API_KEY", "")
     if not api_key:
-        return "[ERROR] FIREWORKS_API_KEY not set. Get one at https://fireworks.ai"
+        return _xml_envelope(
+            "api_error",
+            0,
+            activity,
+            "[ERROR] FIREWORKS_API_KEY not set. Get one at https://fireworks.ai",
+        )
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    activity: list[str] = []
-
     async with httpx.AsyncClient(timeout=300) as client:
         for iteration in range(max_iterations):
             try:
                 messages = enforce_context_budget(messages)
             except ValueError as e:
-                return f"[ERROR] {e}" + _format_activity_footer(activity, iteration + 1)
+                return _xml_envelope(
+                    "context_overflow", iteration + 1, activity, f"[ERROR] {e}"
+                )
 
             try:
                 msg = await _stream_response(
@@ -169,7 +190,7 @@ async def agent_loop(
                     },
                 )
             except (RuntimeError, httpx.HTTPError, httpx.StreamError, OSError) as e:
-                return str(e) + _format_activity_footer(activity, iteration + 1)
+                return _xml_envelope("api_error", iteration + 1, activity, str(e))
 
             # Validate all tool calls parse correctly before appending assistant message
             tool_calls = msg.get("tool_calls", [])
@@ -177,15 +198,18 @@ async def agent_loop(
 
             if parse_errors:
                 # Return error without appending malformed assistant message
-                return "\n".join(parse_errors) + _format_activity_footer(
-                    activity, iteration + 1
+                return _xml_envelope(
+                    "tool_call_parse_error",
+                    iteration + 1,
+                    activity,
+                    "\n".join(parse_errors),
                 )
 
             messages.append(msg)
 
             if not tool_calls:
                 result = msg.get("content") or "(empty response)"
-                return result + _format_activity_footer(activity, iteration + 1)
+                return _xml_envelope("completed", iteration + 1, activity, result)
 
             for call in parsed_calls:
                 # Enforce runtime tool allowlist
@@ -203,7 +227,7 @@ async def agent_loop(
 
                 if call.name == "done":
                     summary = exec_tool(call.name, call.arguments, cwd)
-                    return summary + _format_activity_footer(activity, iteration + 1)
+                    return _xml_envelope("completed", iteration + 1, activity, summary)
 
                 result = exec_tool(call.name, call.arguments, cwd)
                 messages.append(
@@ -214,8 +238,11 @@ async def agent_loop(
                     }
                 )
 
-    return f"[Hit iteration limit ({max_iterations})]" + _format_activity_footer(
-        activity, max_iterations
+    return _xml_envelope(
+        "max_iterations",
+        max_iterations,
+        activity,
+        f"[Hit iteration limit ({max_iterations})]",
     )
 
 
@@ -328,7 +355,7 @@ async def firepass_worker(
     """
     normalized_cwd = normalize_cwd(cwd)
     clamped_iterations = clamp_max_iterations(max_iterations)
-    return await agent_loop(
+    result = await agent_loop(
         WORKER_SYSTEM,
         prompt,
         context or None,
@@ -336,6 +363,7 @@ async def firepass_worker(
         normalized_cwd,
         clamped_iterations,
     )
+    return _retag_envelope(result, "firepass_worker")
 
 
 @mcp.tool()
@@ -358,7 +386,7 @@ async def firepass_researcher(
     """
     normalized_cwd = normalize_cwd(cwd)
     clamped_iterations = clamp_max_iterations(max_iterations)
-    return await agent_loop(
+    result = await agent_loop(
         RESEARCHER_SYSTEM,
         prompt,
         context or None,
@@ -367,6 +395,7 @@ async def firepass_researcher(
         clamped_iterations,
         blocked_tools=READONLY_BLOCKED_TOOLS,
     )
+    return _retag_envelope(result, "firepass_researcher")
 
 
 @mcp.tool()
@@ -390,7 +419,7 @@ async def firepass_reviewer(
     """
     normalized_cwd = normalize_cwd(cwd)
     clamped_iterations = clamp_max_iterations(max_iterations)
-    return await agent_loop(
+    result = await agent_loop(
         REVIEWER_SYSTEM,
         prompt,
         context or None,
@@ -399,6 +428,7 @@ async def firepass_reviewer(
         clamped_iterations,
         blocked_tools=READONLY_BLOCKED_TOOLS,
     )
+    return _retag_envelope(result, "firepass_reviewer")
 
 
 def main():
