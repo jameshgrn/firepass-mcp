@@ -2,13 +2,14 @@
 
 MCP server that turns [Kimi K2.6 Turbo](https://fireworks.ai) into an agentic coding assistant. The model gets a tool loop — it can read/write files, run shell commands, and search code with ripgrep, ast-grep, jq, and glob — and iterates autonomously until the task is done.
 
-Three tools exposed over MCP:
+Four tools exposed over MCP:
 
 | Tool | Capabilities | Use case |
 |------|-------------|----------|
 | `firepass_worker` | read_file, write_file, edit_file, bash, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done | Coding, refactoring, bug fixes |
 | `firepass_researcher` | read_file, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done (read-only) | Code analysis, architecture review |
 | `firepass_reviewer` | read_file, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done (read-only) | Code review with structured output |
+| `firepass_trio` | researcher → worker → reviewer chain with bounded fix loop-back | Plan-then-implement-then-review in one MCP call |
 
 ## Requirements
 
@@ -105,7 +106,7 @@ If your client reads MCP JSON directly, use:
 
 ## How it works
 
-1. You call `firepass_worker`, `firepass_researcher`, or `firepass_reviewer` with a prompt and a required `cwd`
+1. You call `firepass_worker`, `firepass_researcher`, `firepass_reviewer`, or `firepass_trio` with a prompt and a required `cwd`
 2. The server (`server.py`) sends the prompt to Kimi K2.6 Turbo with function-calling enabled, using `tools.py` for the typed ToolSpec registry and executors and `messages.py` for context budgeting
 3. The model explores the codebase, makes edits, runs tests, and iterates
 4. Every tool has a frozen-dataclass argument contract with `additionalProperties: false` enforced at runtime — unknown fields are rejected
@@ -113,6 +114,39 @@ If your client reads MCP JSON directly, use:
 6. The summary (plus an activity log) is returned as the tool result
 
 All roles get 60 iterations by default (capped at 200), configurable per call.
+
+`firepass_trio` chains researcher, worker, and reviewer: the researcher gathers context, the worker implements, and the reviewer audits the result. The reviewer can send the worker back for fixes up to `max_review_rounds` times (default 2, capped at 5). The response is an XML envelope that contains each sub-result as a separate tag so the calling LLM can address them individually.
+
+### Response format
+
+Every tool result is returned as an XML envelope so the calling LLM can read sub-results structurally.
+
+Single tool (e.g. `firepass_worker`):
+
+```xml
+<firepass_worker status="completed" iterations="4" tool_calls="3">
+  <result>Done: refactored auth logic into helpers.py</result>
+  <activity>
+    <call>read_file(path="src/auth.py")</call>
+    <call>write_file(path="src/helpers.py", content="...")</call>
+    <call>done(result="Done: refactored auth logic into helpers.py")</call>
+  </activity>
+</firepass_worker>
+```
+
+Trio call (`firepass_trio`):
+
+```xml
+<firepass_trio status="approved" rounds="1">
+  <research status="completed" iterations="3" tool_calls="2">...</research>
+  <rounds>
+    <round n="1">
+      <implementation status="completed" iterations="5" tool_calls="4">...</implementation>
+      <review status="completed" iterations="2" tool_calls="1">...</review>
+    </round>
+  </rounds>
+</firepass_trio>
+```
 
 ## Security model
 
@@ -128,6 +162,7 @@ The **worker** has full access including `bash`. It is not sandboxed at the comm
 - Tool output capped at 50K characters
 - Context budget of 200K characters. Phase 1 truncates oldest tool outputs to `[truncated]`; phase 2 compacts assistant tool_call arguments to `{}`. If still over budget, an error is raised rather than silently exceeding.
 - Configurable iteration limits (default 60 for all roles, capped at 200)
+- Review rounds capped at 5 in the trio (default 2)
 
 ## Development
 
