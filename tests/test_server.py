@@ -1070,4 +1070,6 @@ def test_retag_envelope_anchors_open_tag_at_position_zero():
     src = "<firepass_run>body has a stray <firepass_run literal</firepass_run>"
     out = _retag_envelope(src, "implementation")
     # Outer tags renamed; the stray substring in the body is left alone.
-    assert out == "<implementation>body has a stray <firepass_run literal</implementation>"
+    assert (
+        out == "<implementation>body has a stray <firepass_run literal</implementation>"
+    )
