@@ -37,7 +37,7 @@ review_hooks = [
 provider = "fireworks"
 
 [providers.fireworks]
-default_agent = "fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
+default_agent = "accounts/fireworks/routers/kimi-k2p6-turbo"
 base_url = "https://api.fireworks.ai/inference/v1"
 api_key_env = "FIREWORKS_API_KEY"
 
