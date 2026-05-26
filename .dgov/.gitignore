@@ -1,9 +1,0 @@
-# Runtime state — never commit
-state.db
-state.db-wal
-state.db-shm
-runs.log
-out/
-runtime/
-plans/deployed.jsonl
-plans/*/_compiled.toml

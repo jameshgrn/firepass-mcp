@@ -7,3 +7,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .env
+
+# Local-only orchestration / quality infrastructure — never push.
+.dgov/
+.sentrux/
