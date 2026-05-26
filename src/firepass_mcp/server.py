@@ -14,485 +14,28 @@ Configuration via environment variables:
 
 import json
 import os
-import shlex
-import subprocess
-from itertools import islice
-from pathlib import Path
-from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from firepass_mcp.messages import (
+    enforce_context_budget,
+    parse_tool_calls,
+)
+from firepass_mcp.tools import (
+    READONLY_BLOCKED_TOOLS,
+    READONLY_TOOL_DEFS,
+    TOOL_DEFS,
+    clamp_max_iterations,
+    exec_tool,
+    format_tool_activity,
+    normalize_cwd,
+    readonly_tool_names,
+    tool_names,
+)
+
 API_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
 MODEL = os.environ.get("FIREPASS_MODEL", "accounts/fireworks/routers/kimi-k2p6-turbo")
-BASH_TIMEOUT = int(os.environ.get("FIREPASS_BASH_TIMEOUT", "60"))
-OUTPUT_CAP = int(os.environ.get("FIREPASS_MAX_OUTPUT", "50000"))
-READ_CAP = int(os.environ.get("FIREPASS_MAX_READ", "100000"))
-WRITE_CAP = 1_000_000  # 1MB max write size
-CONTEXT_CAP = 200_000  # Max characters for message context
-
-# Dangerous ripgrep flags that could allow code execution
-RIPGREP_BLOCKED_FLAGS = {"--pre", "--pre-glob", "-z", "--search-zip", "--replace", "-r"}
-
-# ---------------------------------------------------------------------------
-# Tool definitions (OpenAI function-calling format)
-# ---------------------------------------------------------------------------
-
-ToolDef = dict[str, Any]
-
-TOOL_DEFS: list[ToolDef] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read file contents. Returns numbered lines.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute file path"},
-                    "offset": {
-                        "type": "integer",
-                        "description": "Start line, 1-based (default 1)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max lines to read (default: all)",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or overwrite a file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute file path"},
-                    "content": {"type": "string", "description": "File content"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Replace exact text in a file. old_text must match exactly once.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute file path"},
-                    "old_text": {
-                        "type": "string",
-                        "description": "Exact text to find (must match once)",
-                    },
-                    "new_text": {"type": "string", "description": "Replacement text"},
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": (
-                "Run a shell command (timeout configurable via FIREPASS_BASH_TIMEOUT). "
-                "Use for: git, python, uv, ruff, pytest, etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Shell command"},
-                    "cwd": {
-                        "type": "string",
-                        "description": "Working directory (default: agent cwd)",
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ripgrep",
-            "description": "Fast regex search via rg. Returns file:line: match.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern"},
-                    "path": {
-                        "type": "string",
-                        "description": "File or dir (default: cwd)",
-                    },
-                    "flags": {
-                        "type": "string",
-                        "description": "Extra rg flags, e.g. '-i -l -C3 --type py -w'",
-                    },
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "glob_find",
-            "description": "Find files matching a glob pattern.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob, e.g. '**/*.py'",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Base directory (default: cwd)",
-                    },
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ast_grep",
-            "description": (
-                "Structural code search via ast-grep (sg). "
-                "Matches code patterns, not text. "
-                "Example: 'def $FUNC($$$ARGS)' or 'console.log($$$)'"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "ast-grep pattern"},
-                    "path": {
-                        "type": "string",
-                        "description": "File or dir (default: cwd)",
-                    },
-                    "lang": {
-                        "type": "string",
-                        "description": "Language: python, javascript, typescript, rust, go …",
-                    },
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "jq",
-            "description": "Query/transform JSON with jq.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "jq filter"},
-                    "file": {"type": "string", "description": "JSON file path"},
-                    "input_json": {
-                        "type": "string",
-                        "description": "JSON string (used if file omitted)",
-                    },
-                },
-                "required": ["expression"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "List directory contents with sizes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory (default: cwd)",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tree",
-            "description": "Directory tree. Excludes __pycache__, .git, node_modules, .venv.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Root dir (default: cwd)",
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Max depth (default: 3)",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "done",
-            "description": (
-                "Signal task completion. MUST call when finished. "
-                "The result is returned to the caller — keep it to a concise "
-                "executive summary (one page max). List files changed, key "
-                "findings, or decisions made. No verbose logs or full code dumps."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "result": {
-                        "type": "string",
-                        "description": (
-                            "One-page executive summary: what you did/found, "
-                            "files changed, key decisions. Be concise."
-                        ),
-                    },
-                },
-                "required": ["result"],
-            },
-        },
-    },
-]
-
-# Read-only roles: no write_file, edit_file, or bash
-READONLY_BLOCKED_TOOLS = frozenset({"write_file", "edit_file", "bash"})
-READONLY_TOOL_DEFS = [
-    t for t in TOOL_DEFS if t["function"]["name"] not in READONLY_BLOCKED_TOOLS
-]
-
-# ---------------------------------------------------------------------------
-# Tool executors
-# ---------------------------------------------------------------------------
-
-
-def _validate_path(path: str, cwd: str) -> Path:
-    """Resolve path and verify it doesn't escape the working directory."""
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(cwd) / p
-    resolved = p.resolve()
-    cwd_resolved = Path(cwd).resolve()
-    if not resolved.is_relative_to(cwd_resolved):
-        raise ValueError(f"Path {path} escapes working directory {cwd}")
-    return resolved
-
-
-def _normalize_cwd(cwd: str) -> str:
-    """Require an existing directory and normalize it to an absolute path."""
-    if not cwd:
-        raise ValueError("cwd is required")
-
-    resolved = Path(cwd).expanduser().resolve()
-    if not resolved.exists():
-        raise ValueError(f"Working directory does not exist: {cwd}")
-    if not resolved.is_dir():
-        raise ValueError(f"Working directory is not a directory: {cwd}")
-    return str(resolved)
-
-
-def _run(cmd: str | list[str], cwd: str) -> str:
-    if isinstance(cmd, str):
-        cmd = ["bash", "-c", cmd]
-    try:
-        r = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=BASH_TIMEOUT
-        )
-        out = r.stdout
-        if r.stderr:
-            out += f"\n[stderr]\n{r.stderr}"
-        if r.returncode != 0:
-            out += f"\n[exit {r.returncode}]"
-        return out[:OUTPUT_CAP]
-    except subprocess.TimeoutExpired:
-        return f"[ERROR] timed out after {BASH_TIMEOUT}s"
-    except Exception as e:
-        return f"[ERROR] {e}"
-
-
-def exec_tool(name: str, args: dict, cwd: str) -> str:
-    """Execute a tool call, return result string."""
-
-    if name == "read_file":
-        try:
-            p = _validate_path(args["path"], cwd)
-            if not p.is_file():
-                return f"[ERROR] Not a regular file: {args['path']}"
-            off = max(args.get("offset", 1) - 1, 0)
-            lim = args.get("limit")
-            lines = []
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                if lim is not None:
-                    # islice already skips to offset — lines are the final selection
-                    lines = list(islice(f, off, off + lim))
-                else:
-                    # Skip to offset, then read with a character budget
-                    for _ in islice(f, off):
-                        pass
-                    total_chars = 0
-                    for line in f:
-                        lines.append(line)
-                        total_chars += len(line)
-                        if total_chars > READ_CAP:
-                            break
-            numbered = [f"{i + off + 1:>6}|{line}" for i, line in enumerate(lines)]
-            return "".join(numbered)[:READ_CAP]
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "write_file":
-        try:
-            content = args["content"]
-            if len(content) > WRITE_CAP:
-                return f"[ERROR] Content size ({len(content)} bytes) exceeds maximum allowed ({WRITE_CAP} bytes)"
-            p = _validate_path(args["path"], cwd)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
-            return f"Wrote {len(content)} bytes to {args['path']}"
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "edit_file":
-        try:
-            p = _validate_path(args["path"], cwd)
-            if not p.is_file():
-                return f"[ERROR] Not a regular file: {args['path']}"
-            if p.stat().st_size > WRITE_CAP:
-                return f"[ERROR] File too large to edit ({p.stat().st_size} bytes, max {WRITE_CAP})"
-            content = p.read_text()
-            old = args["old_text"]
-            count = content.count(old)
-            if count == 0:
-                return f"[ERROR] old_text not found in {args['path']}"
-            if count > 1:
-                return (
-                    f"[ERROR] old_text matches {count} locations — "
-                    "must match exactly once. Add more surrounding context."
-                )
-            p.write_text(content.replace(old, args["new_text"], 1))
-            return f"Edited {args['path']}"
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "bash":
-        cmd_cwd = args.get("cwd")
-        if cmd_cwd:
-            try:
-                _validate_path(cmd_cwd, cwd)
-            except ValueError as e:
-                return f"[ERROR] {e}"
-        return _run(args["command"], cmd_cwd or cwd)
-
-    if name == "ripgrep":
-        flags = args.get("flags", "")
-        try:
-            path = str(_validate_path(args.get("path") or cwd, cwd))
-        except ValueError as e:
-            return f"[ERROR] {e}"
-        # Build command as list to avoid shell injection via flags
-        cmd = ["rg", "--no-heading", "-n"]
-        if flags:
-            flag_tokens = shlex.split(flags)
-            for token in flag_tokens:
-                # Block dangerous long flags
-                if token in RIPGREP_BLOCKED_FLAGS or any(
-                    token.startswith(f"{blocked}=") for blocked in RIPGREP_BLOCKED_FLAGS
-                ):
-                    return f"[ERROR] Blocked dangerous flag: {token}"
-                # Block combined short flags containing 'z' (e.g. -iz, -nz)
-                if (
-                    token.startswith("-")
-                    and not token.startswith("--")
-                    and "z" in token
-                ):
-                    return f"[ERROR] Blocked dangerous flag: {token} (contains -z)"
-            cmd.extend(flag_tokens)
-        cmd.append(args["pattern"])
-        cmd.append(path)
-        return _run(cmd, cwd)
-
-    if name == "glob_find":
-        try:
-            base = _validate_path(args.get("path") or cwd, cwd)
-            cwd_resolved = Path(cwd).resolve()
-            matches = [
-                m
-                for m in sorted(base.glob(args["pattern"]))
-                if m.resolve().is_relative_to(cwd_resolved)
-            ]
-            return "\n".join(str(m) for m in matches[:500]) or "(no matches)"
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "ast_grep":
-        try:
-            path = str(_validate_path(args.get("path") or cwd, cwd))
-        except ValueError as e:
-            return f"[ERROR] {e}"
-        lang = args.get("lang", "")
-        cmd = ["sg", "--pattern", args["pattern"]]
-        if lang:
-            cmd.extend(["--lang", lang])
-        cmd.append(path)
-        return _run(cmd, cwd)
-
-    if name == "jq":
-        f = args.get("file")
-        inp = args.get("input_json")
-        expr = args["expression"]
-        if f:
-            try:
-                validated_f = str(_validate_path(f, cwd))
-            except ValueError as e:
-                return f"[ERROR] {e}"
-            return _run(["jq", expr, validated_f], cwd)
-        if inp:
-            return _run(f"echo {shlex.quote(inp)} | jq {shlex.quote(expr)}", cwd)
-        return "[ERROR] provide file or input_json"
-
-    if name == "list_dir":
-        try:
-            path = _validate_path(args.get("path") or cwd, cwd)
-            return _run(["ls", "-lah", str(path)], cwd)
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "tree":
-        try:
-            path = _validate_path(args.get("path") or cwd, cwd)
-            depth = str(args.get("max_depth", 3))
-            return _run(
-                [
-                    "tree",
-                    "-L",
-                    depth,
-                    "-I",
-                    "__pycache__|.git|node_modules|.venv|.mypy_cache",
-                    str(path),
-                ],
-                cwd,
-            )
-        except Exception as e:
-            return f"[ERROR] {e}"
-
-    if name == "done":
-        return args.get("result", "Done.")
-
-    return f"[ERROR] unknown tool: {name}"
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +47,13 @@ async def _stream_response(
     client: httpx.AsyncClient, headers: dict, payload: dict
 ) -> dict:
     """Make a streaming API call, collect deltas into a complete message dict."""
-    payload["stream"] = True
+    stream_payload = {**payload, "stream": True}
     content_parts: list[str] = []
     tool_calls: dict[int, dict] = {}
 
-    async with client.stream("POST", API_URL, headers=headers, json=payload) as resp:
+    async with client.stream(
+        "POST", API_URL, headers=headers, json=stream_payload
+    ) as resp:
         if resp.status_code != 200:
             body = (await resp.aread()).decode(errors="replace")[:500]
             raise RuntimeError(f"[API ERROR {resp.status_code}] {body}")
@@ -520,8 +65,11 @@ async def _stream_response(
                 break
             try:
                 chunk = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as e:
+                excerpt = data_str[:200]
+                raise RuntimeError(
+                    f"[API ERROR] invalid streaming JSON: {e}: {excerpt}"
+                )
             choices = chunk.get("choices", [])
             if not choices:
                 continue
@@ -557,38 +105,6 @@ async def _stream_response(
     return msg
 
 
-def _activity_entry(fn: str, args: dict, cwd: str) -> str:
-    """Format a single tool call as a compact activity log line."""
-    if fn == "read_file":
-        return f"[read]  {args.get('path', '?')}"
-    if fn == "write_file":
-        path = args.get("path", "?")
-        size = len(args.get("content", ""))
-        return f"[write] {path} ({size} bytes)"
-    if fn == "edit_file":
-        return f"[edit]  {args.get('path', '?')}"
-    if fn == "bash":
-        cmd = args.get("command", "?")
-        if len(cmd) > 80:
-            cmd = cmd[:77] + "..."
-        return f"[bash]  {cmd}"
-    if fn == "ripgrep":
-        pat = args.get("pattern", "?")
-        path = args.get("path") or cwd
-        return f"[rg]    {pat!r} in {path}"
-    if fn == "glob_find":
-        return f"[glob]  {args.get('pattern', '?')} in {args.get('path') or cwd}"
-    if fn == "ast_grep":
-        return f"[sg]    {args.get('pattern', '?')}"
-    if fn == "jq":
-        return f"[jq]    {args.get('expression', '?')}"
-    if fn == "list_dir":
-        return f"[ls]    {args.get('path') or cwd}"
-    if fn == "tree":
-        return f"[tree]  {args.get('path') or cwd} (depth={args.get('max_depth', 3)})"
-    return f"[{fn}]"
-
-
 def _format_activity_footer(activity: list[str], iterations: int) -> str:
     """Build the structured activity footer appended to done() results."""
     if not activity:
@@ -602,21 +118,6 @@ def _format_activity_footer(activity: list[str], iterations: int) -> str:
         lines.append(entry)
     lines.append("--- END ---")
     return "\n".join(lines)
-
-
-def _enforce_context_budget(messages: list[dict]) -> None:
-    """Truncate old tool messages if total context exceeds CONTEXT_CAP."""
-    total = sum(len(msg.get("content", "")) for msg in messages)
-    if total <= CONTEXT_CAP:
-        return
-    # Truncate oldest tool messages first, keeping recent context
-    for msg in messages:
-        if msg.get("role") == "tool" and msg["content"] != "[truncated]":
-            freed = len(msg["content"]) - len("[truncated]")
-            msg["content"] = "[truncated]"
-            total -= freed
-            if total <= CONTEXT_CAP:
-                break
 
 
 async def agent_loop(
@@ -651,6 +152,11 @@ async def agent_loop(
     async with httpx.AsyncClient(timeout=300) as client:
         for iteration in range(max_iterations):
             try:
+                messages = enforce_context_budget(messages)
+            except ValueError as e:
+                return f"[ERROR] {e}" + _format_activity_footer(activity, iteration + 1)
+
+            try:
                 msg = await _stream_response(
                     client,
                     headers,
@@ -667,15 +173,7 @@ async def agent_loop(
 
             # Validate all tool calls parse correctly before appending assistant message
             tool_calls = msg.get("tool_calls", [])
-            parse_errors = []
-            parsed_calls = []
-            for tc in tool_calls:
-                fn = tc["function"]["name"]
-                try:
-                    fn_args = json.loads(tc["function"]["arguments"])
-                    parsed_calls.append((tc, fn, fn_args))
-                except (json.JSONDecodeError, KeyError) as e:
-                    parse_errors.append(f"[ERROR] Failed to parse {fn} arguments: {e}")
+            parsed_calls, parse_errors = parse_tool_calls(tool_calls)
 
             if parse_errors:
                 # Return error without appending malformed assistant message
@@ -689,45 +187,32 @@ async def agent_loop(
                 result = msg.get("content") or "(empty response)"
                 return result + _format_activity_footer(activity, iteration + 1)
 
-            for tc, fn, fn_args in parsed_calls:
+            for call in parsed_calls:
                 # Enforce runtime tool allowlist
-                if fn in blocked_tools:
+                if call.name in blocked_tools:
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": tc.get("id", ""),
-                            "content": f"[ERROR] Tool '{fn}' is not allowed in this mode",
+                            "tool_call_id": call.tool_call_id,
+                            "content": f"[ERROR] Tool '{call.name}' is not allowed in this mode",
                         }
                     )
                     continue
 
-                # Ensure args is a dict (model may return [] or null)
-                if not isinstance(fn_args, dict):
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.get("id", ""),
-                            "content": f"[ERROR] Expected dict arguments, got {type(fn_args).__name__}",
-                        }
-                    )
-                    continue
+                activity.append(format_tool_activity(call.name, call.arguments, cwd))
 
-                activity.append(_activity_entry(fn, fn_args, cwd))
-
-                if fn == "done":
-                    summary = fn_args.get("result", msg.get("content", "Done."))
+                if call.name == "done":
+                    summary = exec_tool(call.name, call.arguments, cwd)
                     return summary + _format_activity_footer(activity, iteration + 1)
 
-                result = exec_tool(fn, fn_args, cwd)
+                result = exec_tool(call.name, call.arguments, cwd)
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc.get("id", ""),
+                        "tool_call_id": call.tool_call_id,
                         "content": result,
                     }
                 )
-
-            _enforce_context_budget(messages)
 
     return f"[Hit iteration limit ({max_iterations})]" + _format_activity_footer(
         activity, max_iterations
@@ -738,10 +223,12 @@ async def agent_loop(
 # System prompts
 # ---------------------------------------------------------------------------
 
-WORKER_SYSTEM = """\
+WORKER_TOOL_LIST = ", ".join(tool_names())
+READONLY_TOOL_LIST = ", ".join(readonly_tool_names())
+
+WORKER_SYSTEM = f"""\
 You are a senior software engineer inside an agentic coding harness.
-You have tools to read, write, and edit files, run shell commands, \
-and search code with ripgrep, ast-grep, jq, and glob.
+You have tools available: {WORKER_TOOL_LIST}.
 
 Workflow:
 1. Explore first — use ripgrep/glob/tree to understand the codebase before editing
@@ -761,10 +248,9 @@ Your done() result is returned to a supervising agent. Keep it to a ONE PAGE \
 executive summary: files changed, what you did, key decisions. No full code dumps, \
 no verbose logs. The supervisor can read the files if it needs details."""
 
-RESEARCHER_SYSTEM = """\
+RESEARCHER_SYSTEM = f"""\
 You are a technical researcher inside a read-only agent harness.
-You have tools to read files, search code with ripgrep/ast-grep/jq/glob, \
-list directories, and view directory trees.
+You have read-only tools available: {READONLY_TOOL_LIST}.
 You CANNOT write, edit files, or run shell commands.
 
 Workflow:
@@ -784,10 +270,9 @@ Your done() result is returned to a supervising agent. Keep it to a ONE PAGE \
 executive summary: key findings, file locations, conclusions. No full file dumps — \
 cite file:line references. The supervisor can read the files itself."""
 
-REVIEWER_SYSTEM = """\
+REVIEWER_SYSTEM = f"""\
 You are a senior code reviewer inside a read-only agent harness.
-You have tools to read files, search code with ripgrep/ast-grep/jq/glob, \
-list directories, and view directory trees.
+You have read-only tools available: {READONLY_TOOL_LIST}.
 You CANNOT write, edit files, or run shell commands.
 
 Workflow:
@@ -841,14 +326,15 @@ async def firepass_worker(
         context: Optional file contents, errors, or specs to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         WORKER_SYSTEM,
         prompt,
         context or None,
         TOOL_DEFS,
         normalized_cwd,
-        max_iterations,
+        clamped_iterations,
     )
 
 
@@ -870,14 +356,15 @@ async def firepass_researcher(
         context: Optional file contents, docs, or code to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         RESEARCHER_SYSTEM,
         prompt,
         context or None,
         READONLY_TOOL_DEFS,
         normalized_cwd,
-        max_iterations,
+        clamped_iterations,
         blocked_tools=READONLY_BLOCKED_TOOLS,
     )
 
@@ -901,14 +388,15 @@ async def firepass_reviewer(
         context: Optional diff, file contents, or PR description to pre-load.
         max_iterations: Max tool-call rounds (default 60).
     """
-    normalized_cwd = _normalize_cwd(cwd)
+    normalized_cwd = normalize_cwd(cwd)
+    clamped_iterations = clamp_max_iterations(max_iterations)
     return await agent_loop(
         REVIEWER_SYSTEM,
         prompt,
         context or None,
         READONLY_TOOL_DEFS,
         normalized_cwd,
-        max_iterations,
+        clamped_iterations,
         blocked_tools=READONLY_BLOCKED_TOOLS,
     )
 
