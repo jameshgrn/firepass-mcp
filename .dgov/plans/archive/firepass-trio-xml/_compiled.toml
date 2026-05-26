@@ -1,0 +1,660 @@
+[plan]
+name = "firepass-trio-xml"
+source_mtime_max = "2026-05-26T15:07:09.379508Z"
+sop_set_hash = "f66fb6ba39834e8bcc1e0807df5fa516af066ac23c03a9c8db11b4a459564e3f"
+
+[tasks."tasks/docs.docs"]
+summary = "Document firepass_trio and the XML envelope in README.md."
+prompt = """
+Orient:
+- Read `README.md` after the prior tasks landed.
+- Read `src/firepass_mcp/server.py` to confirm the final
+  `firepass_trio` signature and the exact XML envelope shape.
+
+Edit:
+1. Tools table at the top: add a fourth row for `firepass_trio` listing
+   its capabilities (chain of researcher + worker + reviewer with
+   bounded loop-back) and a representative use case
+   ("Plan-then-implement-then-review in one MCP call").
+2. In the "How it works" section, add a short paragraph after the
+   existing numbered list describing the trio:
+   - One sentence on what it does
+   - One sentence on `max_review_rounds` (default 2, capped at 5)
+   - One sentence saying the response is an XML envelope so the
+     calling LLM can address each sub-result
+3. Add a new "Response format" subsection (or extend an existing one
+   if it fits cleanly) that shows the actual XML shape with one
+   compact example each for a single-tool call and for a trio call.
+   Use fenced code blocks. Keep examples short — 10–15 lines per
+   block max.
+4. In the Limits bullets, add: "Review rounds capped at 5 in the trio
+   (default 2)".
+
+Hard rules:
+- Tone: factual. No `robust`, `powerful`, `elegant`, `seamless`,
+  `comprehensive`, `critical`, `crucial`, `ensures`.
+- Replace text in place. Do not stack "but actually" clauses.
+- Do not add badges, emoji, or links to nonexistent pages.
+
+Verify:
+- `uv run pytest -q tests/test_server.py`  (sanity: doc task should
+  not break tests)
+- `uv run ruff check src tests`
+- `uv run ruff format --check src tests`
+"""
+commit_message = "Document firepass_trio and XML response envelope"
+depends_on = ["tasks/trio.trio"]
+timeout_s = 0
+files.edit = ["README.md"]
+files.read = ["src/firepass_mcp/server.py", "src/firepass_mcp/tools.py", "tests/test_server.py"]
+
+[tasks."tasks/review.review"]
+summary = "Review the full XML-envelope + firepass_trio change set."
+prompt = """
+[SOP: Code Review Standards]
+Summary: What to look for and how to structure findings when reviewing code changes.
+Applies To: review, reviewer, diff, audit, inspect, finding
+Priority: MUST
+
+When:
+- reviewing any code change as a reviewer role
+- evaluating a diff for semantic correctness
+
+Do:
+- reason backward from the implementation, not from the spec or task prompt
+- flag logic errors, no-ops, silently wrong behavior, and missing edge cases
+- check if the code is simple enough to debug (if writing it was hard, debugging it will be harder)
+- flag behavior that would surprise the next reader of this code
+- flag changes to public interfaces that break implicit contracts downstream
+- note coupling chains that reach through multiple objects to get data
+- structure findings by severity: blocking issues first, then suggestions
+
+Do Not:
+- flag style preferences (naming, formatting, comment quality)
+- suggest architectural rewrites beyond the scope of the diff
+- flag pre-existing issues that the diff did not introduce
+- demand missing tests (that is a separate concern)
+
+Verify:
+- read surrounding code for context before flagging something as wrong
+- confirm a flagged pattern is actually new in this diff, not pre-existing
+
+Escalate:
+- if the change reveals systemic issues beyond the diff scope
+- if the diff touches a public API in a way that could break unknown consumers
+
+[SOP: State Modeling Review]
+Summary: Flag state bloat, sentinel values, grab-bag models, and mutation ambiguity in reviewed code.
+Applies To: state, model, dataclass, pydantic, types, review, typed, sentinel, optional, frozen, getattr, enum
+Priority: MUST
+
+When:
+- reviewing changes to data models, state types, or lifecycle code
+- reviewing code that adds boolean flags, optional fields, or status strings
+
+Do:
+- flag sentinel values (empty string, zero, "none") where None would express absence
+- flag optional-field grab-bags where a discriminated union would make wrong states impossible
+- flag functions that mutate their input AND return it (pick one: mutate and return None, or clone and return new)
+- flag if-chains where every branch returns the same shape (convert to a data table)
+- flag dead type variants that are never constructed
+- flag stored state that could be derived from existing data or events
+
+Do Not:
+- demand refactoring beyond the task scope
+- flag working patterns just because they are not ideal if the diff did not introduce them
+- flag genuine state machines as "stored state" (a checkout step IS the state, not a cached conclusion)
+
+Verify:
+- check whether flagged patterns are new in this diff or pre-existing
+- confirm the suggested alternative actually fits the domain before recommending it
+
+Escalate:
+- if state model issues are systemic (multiple models affected across the codebase)
+- if fixing the model would change persistence semantics or public interfaces
+
+Orient:
+- The dependency diff is auto-generated from the upstream tasks. Bound
+  the review to that diff plus the files those tasks claim.
+- Acceptance gates already passed: pytest, ruff, ruff format, ty all
+  green per the verify recipe.
+
+Edit:
+- Reviewer only. No file edits.
+
+Review focus (in priority order):
+1. **Envelope shape correctness** — is the XML well-formed under all
+   six status branches (completed / max_iterations / api_error /
+   context_overflow / tool_call_parse_error / done)? Are attribute
+   values escaped? Is the `<activity>` block ordered chronologically?
+2. **Trio loop-back semantics** — does the worker actually receive
+   the reviewer's findings as context on the second pass, or just a
+   re-issued original prompt? Verify by reading
+   `_run_trio_chain` and the matching test.
+3. **`_rewrap_envelope` correctness** — string-slicing-based tag
+   rename. Does it survive multi-line content, nested tags inside the
+   body, attribute values containing `>` (should be escaped), and the
+   absence of attributes? If brittle, propose a fix; do not apply.
+4. **Status taxonomy** — are the seven statuses (six single-tool +
+   trio's `approved`/`needs_fixes`/`research_failed`/etc.) used
+   consistently? Any silent fallthrough that hides errors as
+   `completed`?
+5. **Test coverage** — is `max_review_rounds=1` behavior tested? Is the
+   case where researcher returns a non-completed envelope tested? Is
+   the loop-back-then-approve path tested?
+6. **API surface drift** — did the three existing MCP tools gain
+   parameters they shouldn't have? `firepass_worker`'s signature must
+   stay (`prompt, cwd, context="", max_iterations=60`).
+7. **README** — does the documented envelope shape match what the
+   code emits? Any drift?
+
+Output structure for the `done()` body:
+- `VERIFIED`: claims confirmed (file:line each)
+- `BLOCKING`: bugs that would justify a revert (file:line + repro)
+- `SUGGESTIONS`: non-blocking improvements
+- `VERDICT`: APPROVE / NEEDS-FIXES
+
+Under 700 words.
+"""
+commit_message = ""
+role = "reviewer"
+depends_on = ["tasks/xml-envelope.xml-envelope", "tasks/trio.trio", "tasks/docs.docs"]
+timeout_s = 0
+sop_mapping = ["code-review", "state-modeling-review"]
+
+[tasks."tasks/trio.trio"]
+summary = "Add firepass_trio MCP tool: researcher → worker → reviewer with bounded loop-back."
+prompt = """
+[SOP: Code Review Standards]
+Summary: What to look for and how to structure findings when reviewing code changes.
+Applies To: review, reviewer, diff, audit, inspect, finding
+Priority: MUST
+
+When:
+- reviewing any code change as a reviewer role
+- evaluating a diff for semantic correctness
+
+Do:
+- reason backward from the implementation, not from the spec or task prompt
+- flag logic errors, no-ops, silently wrong behavior, and missing edge cases
+- check if the code is simple enough to debug (if writing it was hard, debugging it will be harder)
+- flag behavior that would surprise the next reader of this code
+- flag changes to public interfaces that break implicit contracts downstream
+- note coupling chains that reach through multiple objects to get data
+- structure findings by severity: blocking issues first, then suggestions
+
+Do Not:
+- flag style preferences (naming, formatting, comment quality)
+- suggest architectural rewrites beyond the scope of the diff
+- flag pre-existing issues that the diff did not introduce
+- demand missing tests (that is a separate concern)
+
+Verify:
+- read surrounding code for context before flagging something as wrong
+- confirm a flagged pattern is actually new in this diff, not pre-existing
+
+Escalate:
+- if the change reveals systemic issues beyond the diff scope
+- if the diff touches a public API in a way that could break unknown consumers
+
+[SOP: Large File Handling]
+Summary: Use targeted reads and surgical edits on large files to preserve context window and diff clarity.
+Applies To: python, javascript, typescript, large-file, chunk, binary
+Priority: MUST
+
+When:
+- reading or editing files over ~200 lines
+- working with data files, configs, or generated code
+
+Do:
+- use file_symbols first to locate the target function or class
+- use read_file with line ranges for focused context
+- use head, tail, or word_count to gauge size before full reads
+- use edit_file or apply_patch for surgical changes
+
+Do Not:
+- read an entire large file when you only need one function
+- use write_file on files larger than 100 lines when edit_file suffices
+- read the same large file multiple times without narrowing the range
+
+Verify:
+- confirm your edit did not introduce unintended changes in untouched sections
+- check that git_diff shows only the intended hunks
+
+Escalate:
+- if the task requires understanding the full file structure (request file_symbols output first)
+
+[SOP: Python Toolchain & Code Style]
+Summary: Python toolchain defaults and code-style rules for focused, explicit changes.
+Applies To: python, lint, format, style, ruff, naming, convention
+Priority: MUST
+
+When:
+- editing Python source or tests
+- choosing lint, format, or type-check commands
+- touching functions or stateful code that could drift toward cleverness or flag piles
+
+Do:
+- prefer explicit, readable logic over dense cleverness
+- keep semantic functions pure and isolate orchestration side effects
+
+Do Not:
+- leave commented-out code behind
+- add docstrings, comments, or type annotations to code you did not change
+- add premature abstractions before the pattern is repeated enough to justify them
+- accumulate boolean flags or mutate input objects while also returning the same reference
+
+Verify:
+- fix every warning from lint, type checks, and targeted tests
+- run the narrowest relevant Python verification commands for the files you changed
+- review the final diff for unintended rewrites or formatting churn
+
+Escalate:
+- if the requested fix requires a broader refactor than the claimed files allow
+- if repo toolchain commands in `project.toml` do not match the actual project
+
+[SOP: Assign Return Values at API Boundaries]
+Summary: Prevent silent no-ops from unassigned getter, factory, and builder calls.
+Applies To: python, javascript, typescript, api, plugin, return, interface, contract
+Priority: MUST
+
+When:
+- calling methods that return a value you need (getters, factories, builders, parsers)
+- working with unfamiliar APIs or libraries where return types are not obvious
+- chaining operations where an intermediate result must be captured
+
+Do:
+- always assign the return value of `.get()`, `.create()`, `.build()`, `.parse()`, `.copy()`, `.replace()`, `.with_*()`, and similar factory/transform methods
+- verify that the variable you assign to is actually used downstream
+- check the API docs or source for whether a method mutates in-place vs returns a new value
+- when calling a method on an external object, confirm the method exists on that type
+
+Do Not:
+- call a getter or factory method as a standalone expression (bare `self.x.get(...)` on its own line)
+- assume a method mutates the receiver; many APIs return a new object instead
+- call methods that do not exist on the receiver type (e.g. `.grab()` on a class without it)
+- use `result.model_dump()` on a plain dict or `obj.engine()` on a class that lacks it
+
+Verify:
+- search your diff for bare method calls on their own line that are not `print`, `logger.*`, `.append()`, `.extend()`, `.add()`, `.remove()`, `.close()`, `.emit()`, or similar void methods
+- for every assignment from an external API call, confirm the method exists and returns what you expect
+- if a parameter is set via a builder pattern, confirm the final object reflects the change
+
+Escalate:
+- if the API documentation is ambiguous about return type vs in-place mutation
+- if the method you need does not exist on the target class
+
+[SOP: Testing Conventions]
+Summary: Testing rules for targeted execution, scope discipline, and behavior-first verification.
+Applies To: tests, test, pytest, verification, coverage, assert, unit
+Priority: MUST
+
+When:
+- writing or editing tests
+- choosing verification commands after a code change
+- investigating test failures during worker verification
+
+Do:
+- use `pytest -q`
+- run targeted subsets with markers like `-m unit` or `-m integration`
+- test behavior and edge cases, not just implementation details
+- mock boundaries only: network, filesystem, and external services
+- confirm a relevant test would fail before claiming the fix is real
+
+Do Not:
+- run the full test suite
+- mock logic or internal state just to force a passing result
+
+Verify:
+- rerun the exact targeted command that covers the changed behavior
+- confirm scope violations are avoided before settlement
+
+Escalate:
+- if the right test file is outside the current claim
+- if any verification command points to an unclaimed file, report the exact command and path instead of widening scope ad hoc
+- if the change needs broader integration coverage than the task currently allows
+
+Orient:
+- Read `src/firepass_mcp/server.py` after the xml-envelope task lands.
+  The three MCP wrappers (`firepass_worker`, `firepass_researcher`,
+  `firepass_reviewer`) and `agent_loop` are now wrapped in
+  `_xml_envelope`. Reuse that helper here.
+- Read `src/firepass_mcp/tools.py` for `TOOL_DEFS`, `READONLY_TOOL_DEFS`,
+  `READONLY_BLOCKED_TOOLS`, `normalize_cwd`, `clamp_max_iterations`,
+  `MAX_ITERATIONS_LIMIT`.
+- Read `tests/test_server.py` for existing test patterns (monkeypatched
+  `agent_loop`, recorded args). Mirror those for the new tests.
+
+Spec — what `firepass_trio` does:
+- New MCP tool registered on the same `FastMCP` server as the other
+  three. Decorator: `@mcp.tool()`.
+- Signature:
+    `async def firepass_trio(prompt: str, cwd: str, context: str = "",
+        max_iterations: int = 60, max_review_rounds: int = 2) -> str:`
+- Flow:
+    1. Run researcher once with the user prompt → research findings.
+    2. Run worker with the user prompt + researcher findings as
+       context → implementation result.
+    3. Run reviewer with the user prompt + worker result as context →
+       review verdict.
+    4. If the reviewer's `done()` body contains the literal string
+       `NEEDS-FIXES` and `rounds_used < max_review_rounds`, run worker
+       again with the reviewer findings appended to context, then
+       reviewer again. Repeat until APPROVE or rounds exhausted.
+    5. Wrap the whole run in `<firepass_trio status="...">` with
+       nested `<research>`, then a `<rounds>` block containing one
+       `<round n="1">` per worker+reviewer pair, each carrying a
+       nested `<implementation>` and `<review>`.
+- `status` values for the trio root:
+    * `"approved"` — final reviewer verdict was APPROVE
+    * `"needs_fixes"` — rounds exhausted with reviewer still saying
+      NEEDS-FIXES
+    * `"research_failed"` — researcher returned non-completed status
+    * `"implementation_failed"` — worker returned non-completed status
+    * `"review_failed"` — reviewer returned non-completed status
+- Each nested `<research>`, `<implementation>`, `<review>` envelope is
+  exactly the string already produced by the corresponding sub-call
+  (worker/researcher/reviewer), with its outer tag renamed. Reuse the
+  existing `_retag_envelope(xml, new_tag)` helper added in the
+  xml-envelope task — pass `"research"`, `"implementation"`,
+  or `"review"`. Do NOT re-escape the bodies; the sub-calls already
+  escape them.
+- Both `max_iterations` and `max_review_rounds` are clamped:
+    * `max_iterations`: existing `clamp_max_iterations`.
+    * `max_review_rounds`: new `clamp_max_review_rounds` in tools.py
+      with ceiling `MAX_REVIEW_ROUNDS_LIMIT = 5`. Same semantics
+      (raises on ≤ 0, clamps to ceiling).
+
+Edit:
+1. `src/firepass_mcp/tools.py`:
+   - Add `MAX_REVIEW_ROUNDS_LIMIT = 5` next to `MAX_ITERATIONS_LIMIT`.
+   - Add `clamp_max_review_rounds(value: int) -> int` mirroring
+     `clamp_max_iterations`.
+2. `src/firepass_mcp/server.py`:
+   - Add `firepass_trio` as a new `@mcp.tool()`.
+   - Internal `_run_trio_chain` async helper does the orchestration so
+     `firepass_trio` itself is a thin wrapper that clamps inputs and
+     delegates.
+   - The trio assembles its own envelope WITHOUT `_xml_envelope`
+     (whose `<result>` shape doesn't fit). Build the outer string
+     directly:
+       `<firepass_trio status="..." rounds="N">\\n<research ...>...</research>\\n<rounds>\\n<round n="1">\\n<implementation ...>...</implementation>\\n<review ...>...</review>\\n</round>\\n...\\n</rounds>\\n</firepass_trio>`
+     The `<research>`, `<implementation>`, and `<review>` blocks come
+     from `_retag_envelope` applied to the worker/researcher/reviewer
+     return values. Attribute values on the trio root are integers and
+     do not need escaping.
+   - DO NOT modify `_xml_envelope` itself. DO NOT modify any of the
+     three existing wrappers' signatures or decorators.
+
+Tests — add to `tests/test_server.py`:
+- `test_firepass_trio_approve_first_round` — monkeypatch the three sub
+  MCP tools to return canned approve envelopes; assert trio status is
+  `approved`, exactly one `<round>` exists, researcher ran once.
+- `test_firepass_trio_loops_on_needs_fixes_then_approves` — first
+  reviewer call returns NEEDS-FIXES, second returns APPROVE; assert
+  status `approved`, two `<round>`s, worker called twice with
+  reviewer findings present in the second worker's `context` arg.
+- `test_firepass_trio_exhausts_rounds` — every reviewer call returns
+  NEEDS-FIXES; assert status `needs_fixes`, exactly
+  `max_review_rounds` rounds present.
+- `test_firepass_trio_clamps_max_review_rounds` — call with
+  `max_review_rounds=99`; assert internal max_review_rounds is
+  `MAX_REVIEW_ROUNDS_LIMIT`.
+- `test_firepass_trio_rejects_zero_review_rounds` — call with
+  `max_review_rounds=0` raises ValueError (matches existing iteration
+  clamp behavior).
+- `test_firepass_trio_research_failure_short_circuits` — researcher
+  returns non-completed envelope; assert trio status is
+  `research_failed` and worker was NEVER called.
+- `test_clamp_max_review_rounds_helper` — direct unit test for the
+  new clamp function (valid / negative / zero / huge).
+
+Out of scope:
+- Do NOT touch README.md (separate task).
+- Do NOT change the existing three MCP tools' surface area; the trio
+  composes them, not edits them.
+
+Verify:
+- `uv run pytest -q tests/test_server.py`
+- `uv run ruff check src tests`
+- `uv run ruff format --check src tests`
+- `uv run ty check src`
+"""
+commit_message = "Add firepass_trio chain with reviewer loop-back"
+depends_on = ["tasks/xml-envelope.xml-envelope"]
+timeout_s = 0
+test_cmd = "uv run pytest -q tests/test_server.py"
+sop_mapping = ["code-review", "large-file-handling", "python-style", "return-values", "testing"]
+files.edit = ["src/firepass_mcp/server.py", "src/firepass_mcp/tools.py", "tests/test_server.py"]
+files.read = ["src/firepass_mcp/messages.py"]
+
+[tasks."tasks/xml-envelope.xml-envelope"]
+summary = "Wrap all four MCP tool returns in an XML envelope for the calling LLM to parse."
+prompt = """
+[SOP: Large File Handling]
+Summary: Use targeted reads and surgical edits on large files to preserve context window and diff clarity.
+Applies To: python, javascript, typescript, large-file, chunk, binary
+Priority: MUST
+
+When:
+- reading or editing files over ~200 lines
+- working with data files, configs, or generated code
+
+Do:
+- use file_symbols first to locate the target function or class
+- use read_file with line ranges for focused context
+- use head, tail, or word_count to gauge size before full reads
+- use edit_file or apply_patch for surgical changes
+
+Do Not:
+- read an entire large file when you only need one function
+- use write_file on files larger than 100 lines when edit_file suffices
+- read the same large file multiple times without narrowing the range
+
+Verify:
+- confirm your edit did not introduce unintended changes in untouched sections
+- check that git_diff shows only the intended hunks
+
+Escalate:
+- if the task requires understanding the full file structure (request file_symbols output first)
+
+[SOP: Python Toolchain & Code Style]
+Summary: Python toolchain defaults and code-style rules for focused, explicit changes.
+Applies To: python, lint, format, style, ruff, naming, convention
+Priority: MUST
+
+When:
+- editing Python source or tests
+- choosing lint, format, or type-check commands
+- touching functions or stateful code that could drift toward cleverness or flag piles
+
+Do:
+- prefer explicit, readable logic over dense cleverness
+- keep semantic functions pure and isolate orchestration side effects
+
+Do Not:
+- leave commented-out code behind
+- add docstrings, comments, or type annotations to code you did not change
+- add premature abstractions before the pattern is repeated enough to justify them
+- accumulate boolean flags or mutate input objects while also returning the same reference
+
+Verify:
+- fix every warning from lint, type checks, and targeted tests
+- run the narrowest relevant Python verification commands for the files you changed
+- review the final diff for unintended rewrites or formatting churn
+
+Escalate:
+- if the requested fix requires a broader refactor than the claimed files allow
+- if repo toolchain commands in `project.toml` do not match the actual project
+
+[SOP: Assign Return Values at API Boundaries]
+Summary: Prevent silent no-ops from unassigned getter, factory, and builder calls.
+Applies To: python, javascript, typescript, api, plugin, return, interface, contract
+Priority: MUST
+
+When:
+- calling methods that return a value you need (getters, factories, builders, parsers)
+- working with unfamiliar APIs or libraries where return types are not obvious
+- chaining operations where an intermediate result must be captured
+
+Do:
+- always assign the return value of `.get()`, `.create()`, `.build()`, `.parse()`, `.copy()`, `.replace()`, `.with_*()`, and similar factory/transform methods
+- verify that the variable you assign to is actually used downstream
+- check the API docs or source for whether a method mutates in-place vs returns a new value
+- when calling a method on an external object, confirm the method exists on that type
+
+Do Not:
+- call a getter or factory method as a standalone expression (bare `self.x.get(...)` on its own line)
+- assume a method mutates the receiver; many APIs return a new object instead
+- call methods that do not exist on the receiver type (e.g. `.grab()` on a class without it)
+- use `result.model_dump()` on a plain dict or `obj.engine()` on a class that lacks it
+
+Verify:
+- search your diff for bare method calls on their own line that are not `print`, `logger.*`, `.append()`, `.extend()`, `.add()`, `.remove()`, `.close()`, `.emit()`, or similar void methods
+- for every assignment from an external API call, confirm the method exists and returns what you expect
+- if a parameter is set via a builder pattern, confirm the final object reflects the change
+
+Escalate:
+- if the API documentation is ambiguous about return type vs in-place mutation
+- if the method you need does not exist on the target class
+
+[SOP: Testing Conventions]
+Summary: Testing rules for targeted execution, scope discipline, and behavior-first verification.
+Applies To: tests, test, pytest, verification, coverage, assert, unit
+Priority: MUST
+
+When:
+- writing or editing tests
+- choosing verification commands after a code change
+- investigating test failures during worker verification
+
+Do:
+- use `pytest -q`
+- run targeted subsets with markers like `-m unit` or `-m integration`
+- test behavior and edge cases, not just implementation details
+- mock boundaries only: network, filesystem, and external services
+- confirm a relevant test would fail before claiming the fix is real
+
+Do Not:
+- run the full test suite
+- mock logic or internal state just to force a passing result
+
+Verify:
+- rerun the exact targeted command that covers the changed behavior
+- confirm scope violations are avoided before settlement
+
+Escalate:
+- if the right test file is outside the current claim
+- if any verification command points to an unclaimed file, report the exact command and path instead of widening scope ad hoc
+- if the change needs broader integration coverage than the task currently allows
+
+Orient:
+- Read `src/firepass_mcp/server.py` end-to-end. The current return path
+  is `_format_activity_footer` + concatenation in `agent_loop` and the
+  three MCP tool wrappers (`firepass_worker`, `firepass_researcher`,
+  `firepass_reviewer`).
+- Read `src/firepass_mcp/tools.py` to understand `tool_names()` and
+  `format_tool_activity` — those produce the activity list.
+- Read `tests/test_server.py` to see what currently asserts about output
+  format (currently the activity footer is plain text).
+
+Context — what changes:
+- Current return string is a Kimi-generated result body followed by:
+    `\\n\\n--- ACTIVITY LOG ---\\nIterations: N  |  Tool calls: M\\n<bullets>\\n--- END ---`
+- New return string wraps the same content in XML so the calling LLM
+  can address each section:
+    `<firepass_worker status="..." iterations="N" tool_calls="M">\\n<result>...body...</result>\\n<activity>\\n<call>[edit] /path</call>\\n...\\n</activity>\\n</firepass_worker>`
+- The root tag name is the MCP tool name (worker / researcher /
+  reviewer). For the trio (added in a later task), the root will be
+  `<firepass_trio>` with nested sub-envelopes per round.
+- Status values:
+    * `"completed"` — model called `done()`
+    * `"max_iterations"` — loop exhausted without `done()`
+    * `"api_error"` — Fireworks API or streaming error
+    * `"context_overflow"` — `enforce_context_budget` raised
+    * `"tool_call_parse_error"` — `parse_tool_calls` returned errors
+- The `<result>` body is the same Kimi-generated content as today.
+  Do NOT alter what Kimi writes; only the wrapper changes.
+- `<activity>` carries the existing activity bullets, one per `<call>`
+  tag. Iteration count and tool-call count move to attributes on the
+  root tag (no duplicate plaintext line inside).
+
+Important architectural constraint:
+- DO NOT change the signature of `agent_loop`. dgov settlement has a
+  signature_drift gate; adding parameters to that function will be
+  rejected. Instead, `agent_loop` always emits envelopes with the
+  default root tag `<firepass_run>`. The three MCP wrappers
+  post-process the returned string to rename the outer tag.
+
+Edit:
+1. In `src/firepass_mcp/server.py`, add three small module-private
+   helpers in this order, replacing `_format_activity_footer`:
+   - `_xml_escape(s)` — escape `&`, `<`, `>` (in that order). Three
+     replaces, no html lib.
+   - `_xml_envelope(status, iterations, activity, body)` — return the
+     wrapped string with the hardcoded root tag `firepass_run`. Shape:
+       `<firepass_run status="X" iterations="N" tool_calls="M">\\n<result>...</result>\\n<activity>\\n<call>...</call>\\n...\\n</activity>\\n</firepass_run>`
+     `activity` is a list[str]; map each through `_xml_escape` and
+     wrap in `<call>...</call>`. `body` goes through `_xml_escape`
+     before being placed inside `<result>...</result>`. Iteration
+     count and tool-call count are attribute values on the root.
+   - `_retag_envelope(xml, new_tag)` — rename the outermost
+     `firepass_run` open/close tags to `new_tag`. Pure string slicing:
+     find the literal `<firepass_run` and `</firepass_run>` substrings
+     and replace both (the open form preserves attributes after the
+     tag name, so only the substring `firepass_run` is swapped, not
+     the full open tag). Single replacement of each, not global.
+2. Replace `_format_activity_footer` with `_xml_envelope` at every
+   return point in `agent_loop`. Keep `agent_loop`'s signature
+   exactly as it was on main (no new params). Cover six return paths:
+   - context overflow (top-of-iteration `enforce_context_budget`
+     raised): `status="context_overflow"`
+   - API/streaming error from `_stream_response`: `status="api_error"`
+   - `parse_tool_calls` returned errors: `status="tool_call_parse_error"`
+   - model returned content with no tool_calls (plain completion):
+     `status="completed"`
+   - `done()` tool call: `status="completed"`
+   - iteration limit exhausted: `status="max_iterations"`
+3. In each of the three MCP wrappers (`firepass_worker`,
+   `firepass_researcher`, `firepass_reviewer`), capture the
+   `agent_loop` return value into a variable, then return
+   `_retag_envelope(value, "firepass_worker")` (or `_firepass_researcher`
+   / `_firepass_reviewer`). Do not modify the wrappers'
+   signatures or decorators.
+
+Tests — add to `tests/test_server.py`:
+- `test_xml_envelope_wraps_done_result` — call `firepass_worker`
+  end-to-end with a mocked `_stream_response` that emits a `done()`;
+  assert the returned string starts with
+  `<firepass_worker status="completed"` and contains
+  `<result>` and ends with `</firepass_worker>`.
+- `test_xml_envelope_escapes_result_body` — feed a Kimi-result with `<`
+  and `&` characters; assert they are escaped in the `<result>` block.
+- `test_xml_envelope_status_max_iterations` — exhaust iterations,
+  assert `status="max_iterations"`.
+- `test_xml_envelope_status_api_error` — make `_stream_response` raise
+  `RuntimeError`, assert `status="api_error"`.
+- `test_xml_envelope_status_context_overflow` — pass an oversize
+  system prompt, assert `status="context_overflow"`.
+- `test_xml_envelope_status_tool_call_parse_error` — emit a malformed
+  tool_call shape, assert `status="tool_call_parse_error"`.
+- Update any existing test that pattern-matches the old
+  `--- ACTIVITY LOG ---` footer to match the new XML form.
+
+Out of scope:
+- Do NOT add `firepass_trio` here. Separate task.
+- Do NOT touch `README.md` — that lives in a later task.
+- Do NOT introduce new dependencies.
+
+Verify:
+- `uv run pytest -q tests/test_server.py`
+- `uv run ruff check src tests`
+- `uv run ruff format --check src tests`
+- `uv run ty check src`
+"""
+commit_message = "Wrap MCP tool returns in XML envelope"
+timeout_s = 0
+test_cmd = "uv run pytest -q tests/test_server.py"
+sop_mapping = ["large-file-handling", "python-style", "return-values", "testing"]
+files.edit = ["src/firepass_mcp/server.py", "tests/test_server.py"]
+files.read = ["src/firepass_mcp/tools.py", "src/firepass_mcp/messages.py"]
