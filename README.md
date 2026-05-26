@@ -6,9 +6,9 @@ Three tools exposed over MCP:
 
 | Tool | Capabilities | Use case |
 |------|-------------|----------|
-| `firepass_worker` | read, write, edit, bash, ripgrep, ast-grep, jq, glob, tree | Coding, refactoring, bug fixes |
-| `firepass_researcher` | read, ripgrep, ast-grep, jq, glob, tree (read-only) | Code analysis, architecture review |
-| `firepass_reviewer` | read, ripgrep, ast-grep, jq, glob, tree (read-only) | Code review with structured output |
+| `firepass_worker` | read_file, write_file, edit_file, bash, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done | Coding, refactoring, bug fixes |
+| `firepass_researcher` | read_file, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done (read-only) | Code analysis, architecture review |
+| `firepass_reviewer` | read_file, ripgrep, glob_find, ast_grep, jq, list_dir, tree, done (read-only) | Code review with structured output |
 
 ## Requirements
 
@@ -106,18 +106,19 @@ If your client reads MCP JSON directly, use:
 ## How it works
 
 1. You call `firepass_worker`, `firepass_researcher`, or `firepass_reviewer` with a prompt and a required `cwd`
-2. The server sends the prompt to Kimi K2.6 Turbo with function-calling enabled
+2. The server (`server.py`) sends the prompt to Kimi K2.6 Turbo with function-calling enabled, using `tools.py` for the typed ToolSpec registry and executors and `messages.py` for context budgeting
 3. The model explores the codebase, makes edits, runs tests, and iterates
-4. When done, it calls `done()` with an executive summary
-5. The summary (plus an activity log) is returned as the tool result
+4. Every tool has a frozen-dataclass argument contract with `additionalProperties: false` enforced at runtime — unknown fields are rejected
+5. When done, it calls `done()` with an executive summary
+6. The summary (plus an activity log) is returned as the tool result
 
-All roles get 60 iterations by default, configurable per call.
+All roles get 60 iterations by default (capped at 200), configurable per call.
 
 ## Security model
 
 All file operations (`read_file`, `write_file`, `edit_file`, `glob_find`, `ripgrep`, `ast_grep`, `jq`, `tree`, `list_dir`) are sandboxed to the required `cwd` you provide. Paths are resolved and validated against the working directory before any I/O.
 
-The **researcher** and **reviewer** are read-only — `bash`, `write_file`, and `edit_file` are blocked both at the API schema level (model never sees them) and at runtime (server rejects them even if hallucinated). Dangerous ripgrep flags (`--pre`, `--replace`, `-z`) are also blocked.
+The **researcher** and **reviewer** are read-only — `bash`, `write_file`, and `edit_file` are blocked both at the API schema level (model never sees them) and at runtime (server rejects them even if hallucinated). Dangerous ripgrep flags (`--pre`, `--pre-glob`, `--search-zip`, `--replace`, `-r`, `-z`) are also blocked.
 
 The **worker** has full access including `bash`. It is not sandboxed at the command level — treat it like giving shell access to a remote developer scoped to your project directory.
 
@@ -125,8 +126,24 @@ The **worker** has full access including `bash`. It is not sandboxed at the comm
 - File writes capped at 1 MB per operation
 - File reads capped at 100K characters
 - Tool output capped at 50K characters
-- Context budget of 200K characters (old tool results and bulky tool-call arguments compacted when exceeded; oversized prompt/context text is rejected)
+- Context budget of 200K characters. Phase 1 truncates oldest tool outputs to `[truncated]`; phase 2 compacts assistant tool_call arguments to `{}`. If still over budget, an error is raised rather than silently exceeding.
 - Configurable iteration limits (default 60 for all roles, capped at 200)
+
+## Development
+
+Install dev dependencies and run tests:
+
+```bash
+uv sync
+uv run pytest -q tests/test_server.py
+```
+
+Lint and type-check:
+
+```bash
+uv run ruff check src tests
+uv run ty check src
+```
 
 ## License
 
