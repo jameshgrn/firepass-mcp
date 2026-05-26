@@ -125,8 +125,8 @@ The **worker** has full access including `bash`. It is not sandboxed at the comm
 - File writes capped at 1 MB per operation
 - File reads capped at 100K characters
 - Tool output capped at 50K characters
-- Context budget of 200K characters (old tool results truncated when exceeded)
-- Configurable iteration limits (default 60 for all roles)
+- Context budget of 200K characters (old tool results and bulky tool-call arguments compacted when exceeded; oversized prompt/context text is rejected)
+- Configurable iteration limits (default 60 for all roles, capped at 200)
 
 ## License
 
