@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -28,6 +29,7 @@ from firepass_mcp.tools import (
     MAX_REVIEW_ROUNDS_LIMIT,
     READONLY_BLOCKED_TOOLS,
     READONLY_TOOL_DEFS,
+    _run,
     _validate_path,
     clamp_max_iterations,
     clamp_max_review_rounds,
@@ -1237,3 +1239,37 @@ def test_firepass_trio_worker_receives_reviewer_body_on_loopback(monkeypatch, tm
     # Second worker invocation must include the reviewer result body, not activity noise
     assert "FIX_THIS" in worker_contexts[1]
     assert "ACTIVITY_NOISE" not in worker_contexts[1]
+
+
+# ---------------------------------------------------------------------------
+# 5. _run exception narrowing
+# ---------------------------------------------------------------------------
+
+
+def test_run_catches_subprocess_error(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.SubprocessError("boom")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = _run("echo hi", "/tmp")
+    assert result.startswith("[ERROR]")
+    assert "boom" in result
+
+
+def test_run_catches_oserror(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("no such file")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = _run("echo hi", "/tmp")
+    assert result.startswith("[ERROR]")
+    assert "no such file" in result
+
+
+def test_run_lets_programming_errors_propagate(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise NameError("x is not defined")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(NameError):
+        _run("echo hi", "/tmp")
