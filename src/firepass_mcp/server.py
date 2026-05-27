@@ -160,6 +160,20 @@ def _retag_envelope(xml: str, new_tag: str) -> str:
     return head + f"</{new_tag}>"
 
 
+def _extract_result_body(envelope: str) -> str:
+    """Return the substring between the first <result> and the first </result>."""
+    open_tag = "<result>"
+    close_tag = "</result>"
+    start = envelope.find(open_tag)
+    if start == -1:
+        return ""
+    start += len(open_tag)
+    end = envelope.find(close_tag, start)
+    if end == -1:
+        return ""
+    return envelope[start:end]
+
+
 async def agent_loop(
     system: str,
     prompt: str,
@@ -352,7 +366,9 @@ Your done() result is returned to a supervising agent. Structure it as:
 **Suggestions**: Non-blocking improvements (design, performance, style).
 **Good**: What's done well.
 
-Cite file:line for every item. No full code dumps."""
+Cite file:line for every item. No full code dumps.
+
+Begin your output with the literal line "VERDICT: APPROVE" or "VERDICT: NEEDS-FIXES" — nothing else on that line. The trio loop reads this line verbatim."""
 
 # ---------------------------------------------------------------------------
 # MCP entry points
@@ -517,10 +533,16 @@ async def _run_trio_chain(
                 "review_failed", rounds_used, research_xml, rounds_xml
             )
 
-        if "NEEDS-FIXES" not in review_xml or rounds_used >= max_review_rounds:
+        if (
+            "NEEDS-FIXES" not in _extract_result_body(review_xml)
+            or rounds_used >= max_review_rounds
+        ):
             status = (
                 "needs_fixes"
-                if ("NEEDS-FIXES" in review_xml and rounds_used >= max_review_rounds)
+                if (
+                    "NEEDS-FIXES" in _extract_result_body(review_xml)
+                    and rounds_used >= max_review_rounds
+                )
                 else "approved"
             )
             return _build_trio_response(status, rounds_used, research_xml, rounds_xml)
