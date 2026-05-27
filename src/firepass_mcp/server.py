@@ -14,6 +14,7 @@ Configuration via environment variables:
 
 import json
 import os
+import re
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -172,6 +173,18 @@ def _extract_result_body(envelope: str) -> str:
     if end == -1:
         return ""
     return envelope[start:end]
+
+
+_VERDICT_NEEDS_FIXES_RE = re.compile(r"^\s*VERDICT:\s*NEEDS-FIXES\b", re.MULTILINE)
+
+
+def _verdict_needs_fixes(result_body: str) -> bool:
+    """True iff result body has a line whose verdict sentinel is NEEDS-FIXES.
+
+    Anchored to the literal ``VERDICT:`` prefix at line start so that prose
+    mentions of ``NEEDS-FIXES`` (e.g. in cited feedback) do not trip the gate.
+    """
+    return _VERDICT_NEEDS_FIXES_RE.search(result_body) is not None
 
 
 async def agent_loop(
@@ -534,23 +547,19 @@ async def _run_trio_chain(
                 "review_failed", rounds_used, research_xml, rounds_xml
             )
 
-        if (
-            "NEEDS-FIXES" not in _extract_result_body(review_xml)
-            or rounds_used >= max_review_rounds
-        ):
+        review_body = _extract_result_body(review_xml)
+        needs_fixes = _verdict_needs_fixes(review_body)
+
+        if not needs_fixes or rounds_used >= max_review_rounds:
             status = (
                 "needs_fixes"
-                if (
-                    "NEEDS-FIXES" in _extract_result_body(review_xml)
-                    and rounds_used >= max_review_rounds
-                )
+                if needs_fixes and rounds_used >= max_review_rounds
                 else "approved"
             )
             return _build_trio_response(status, rounds_used, research_xml, rounds_xml)
 
         # Next round: append reviewer feedback to context and re-run worker
-        reviewer_body = _extract_result_body(review_xml)
-        worker_context = f"{worker_context}\n\nReviewer feedback:\n{reviewer_body}"
+        worker_context = f"{worker_context}\n\nReviewer feedback:\n{review_body}"
         impl_xml = await firepass_worker(
             prompt, cwd, worker_context, max_iterations=max_iterations
         )

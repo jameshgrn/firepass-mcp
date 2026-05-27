@@ -18,6 +18,7 @@ from firepass_mcp.server import (
     _extract_result_body,
     _retag_envelope,
     _stream_response,
+    _verdict_needs_fixes,
     agent_loop,
     firepass_researcher,
     firepass_reviewer,
@@ -838,8 +839,8 @@ def test_firepass_trio_loops_on_needs_fixes_then_approves(monkeypatch, tmp_path)
         call_counts["reviewer"] += 1
         reviewer_calls[0] += 1
         if reviewer_calls[0] == 1:
-            return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>NEEDS-FIXES: fix X</result><activity></activity></firepass_reviewer>'
-        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+            return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>VERDICT: NEEDS-FIXES\nfix X</result><activity></activity></firepass_reviewer>'
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>VERDICT: APPROVE</result><activity></activity></firepass_reviewer>'
 
     monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
     monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
@@ -854,7 +855,8 @@ def test_firepass_trio_loops_on_needs_fixes_then_approves(monkeypatch, tmp_path)
     assert call_counts["worker"] == 2
     assert call_counts["reviewer"] == 2
     # Second worker invocation must include the first reviewer's feedback in context
-    assert "NEEDS-FIXES: fix X" in worker_contexts[1]
+    assert "VERDICT: NEEDS-FIXES" in worker_contexts[1]
+    assert "fix X" in worker_contexts[1]
 
 
 def test_firepass_trio_exhausts_rounds(monkeypatch, tmp_path):
@@ -871,7 +873,7 @@ def test_firepass_trio_exhausts_rounds(monkeypatch, tmp_path):
 
     async def fake_reviewer(prompt, cwd, context, max_iterations):
         call_counts["reviewer"] += 1
-        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>NEEDS-FIXES</result><activity></activity></firepass_reviewer>'
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>VERDICT: NEEDS-FIXES</result><activity></activity></firepass_reviewer>'
 
     monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
     monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
@@ -974,7 +976,7 @@ def test_firepass_trio_max_review_rounds_one_then_needs_fixes(monkeypatch, tmp_p
         call_counts["reviewer"] += 1
         return (
             '<firepass_reviewer status="completed" iterations="1" tool_calls="0">'
-            "<result>NEEDS-FIXES</result><activity></activity></firepass_reviewer>"
+            "<result>VERDICT: NEEDS-FIXES</result><activity></activity></firepass_reviewer>"
         )
 
     monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
@@ -1273,3 +1275,69 @@ def test_run_lets_programming_errors_propagate(monkeypatch):
     monkeypatch.setattr("subprocess.run", fake_run)
     with pytest.raises(NameError):
         _run("echo hi", "/tmp")
+
+
+# ---------------------------------------------------------------------------
+# 18. _verdict_needs_fixes — anchored sentinel match
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_needs_fixes_matches_sentinel_at_body_start():
+    assert _verdict_needs_fixes("VERDICT: NEEDS-FIXES\nfix X") is True
+
+
+def test_verdict_needs_fixes_matches_with_leading_whitespace():
+    assert _verdict_needs_fixes("  VERDICT:  NEEDS-FIXES\ndetails") is True
+
+
+def test_verdict_needs_fixes_matches_on_later_line():
+    body = "preamble line\nVERDICT: NEEDS-FIXES\ntrailing"
+    assert _verdict_needs_fixes(body) is True
+
+
+def test_verdict_needs_fixes_ignores_prose_mention():
+    body = "VERDICT: APPROVE\nthis was close to NEEDS-FIXES but the test fixed it"
+    assert _verdict_needs_fixes(body) is False
+
+
+def test_verdict_needs_fixes_ignores_inline_substring():
+    body = "VERDICT: APPROVE\nreviewer quoted: 'VERDICT: NEEDS-FIXES might apply later'"
+    # 'VERDICT: NEEDS-FIXES' here is not at line start — it's quoted mid-line.
+    assert _verdict_needs_fixes(body) is False
+
+
+def test_verdict_needs_fixes_empty_body():
+    assert _verdict_needs_fixes("") is False
+
+
+def test_firepass_trio_ignores_prose_needs_fixes_in_result(monkeypatch, tmp_path):
+    """NEEDS-FIXES mentioned in <result> prose (not on a VERDICT: line) must not loop."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>findings</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        return (
+            '<firepass_reviewer status="completed" iterations="1" tool_calls="0">'
+            "<result>VERDICT: APPROVE\n"
+            "Summary: clean. Earlier draft was close to NEEDS-FIXES but the test covers it.</result>"
+            "<activity></activity></firepass_reviewer>"
+        )
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path)))
+
+    assert 'status="approved"' in result
+    assert 'rounds="1"' in result
+    assert call_counts["worker"] == 1
+    assert call_counts["reviewer"] == 1
