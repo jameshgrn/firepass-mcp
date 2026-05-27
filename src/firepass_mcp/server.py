@@ -14,6 +14,7 @@ Configuration via environment variables:
 
 import json
 import os
+import re
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -158,6 +159,32 @@ def _retag_envelope(xml: str, new_tag: str) -> str:
 
     head = f"<{new_tag}" + xml[cursor : len(xml) - len(close_marker)]
     return head + f"</{new_tag}>"
+
+
+def _extract_result_body(envelope: str) -> str:
+    """Return the substring between the first <result> and the first </result>."""
+    open_tag = "<result>"
+    close_tag = "</result>"
+    start = envelope.find(open_tag)
+    if start == -1:
+        return ""
+    start += len(open_tag)
+    end = envelope.find(close_tag, start)
+    if end == -1:
+        return ""
+    return envelope[start:end]
+
+
+_VERDICT_NEEDS_FIXES_RE = re.compile(r"^\s*VERDICT:\s*NEEDS-FIXES\b", re.MULTILINE)
+
+
+def _verdict_needs_fixes(result_body: str) -> bool:
+    """True iff result body has a line whose verdict sentinel is NEEDS-FIXES.
+
+    Anchored to the literal ``VERDICT:`` prefix at line start so that prose
+    mentions of ``NEEDS-FIXES`` (e.g. in cited feedback) do not trip the gate.
+    """
+    return _VERDICT_NEEDS_FIXES_RE.search(result_body) is not None
 
 
 async def agent_loop(
@@ -352,7 +379,9 @@ Your done() result is returned to a supervising agent. Structure it as:
 **Suggestions**: Non-blocking improvements (design, performance, style).
 **Good**: What's done well.
 
-Cite file:line for every item. No full code dumps."""
+Cite file:line for every item. No full code dumps.
+
+Begin your output with the literal line "VERDICT: APPROVE" or "VERDICT: NEEDS-FIXES" — nothing else on that line. The trio loop reads this line verbatim."""
 
 # ---------------------------------------------------------------------------
 # MCP entry points
@@ -487,7 +516,8 @@ async def _run_trio_chain(
         return _build_trio_response("research_failed", 0, research_xml, [])
 
     # 2. First implementation
-    worker_context = research_xml
+    research_body = _extract_result_body(research_xml)
+    worker_context = f"Researcher findings:\n{research_body}"
     impl_xml = await firepass_worker(
         prompt, cwd, worker_context, max_iterations=max_iterations
     )
@@ -517,16 +547,19 @@ async def _run_trio_chain(
                 "review_failed", rounds_used, research_xml, rounds_xml
             )
 
-        if "NEEDS-FIXES" not in review_xml or rounds_used >= max_review_rounds:
+        review_body = _extract_result_body(review_xml)
+        needs_fixes = _verdict_needs_fixes(review_body)
+
+        if not needs_fixes or rounds_used >= max_review_rounds:
             status = (
                 "needs_fixes"
-                if ("NEEDS-FIXES" in review_xml and rounds_used >= max_review_rounds)
+                if needs_fixes and rounds_used >= max_review_rounds
                 else "approved"
             )
             return _build_trio_response(status, rounds_used, research_xml, rounds_xml)
 
         # Next round: append reviewer feedback to context and re-run worker
-        worker_context = f"{worker_context}\n\nReviewer feedback:\n{review_xml}"
+        worker_context = f"{worker_context}\n\nReviewer feedback:\n{review_body}"
         impl_xml = await firepass_worker(
             prompt, cwd, worker_context, max_iterations=max_iterations
         )

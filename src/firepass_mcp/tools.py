@@ -351,7 +351,7 @@ def _run(cmd: str | list[str], cwd: str, input_text: str | None = None) -> str:
         return out[:OUTPUT_CAP]
     except subprocess.TimeoutExpired:
         return f"[ERROR] timed out after {BASH_TIMEOUT}s"
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError) as e:
         return f"[ERROR] {e}"
 
 

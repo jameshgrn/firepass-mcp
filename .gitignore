@@ -11,3 +11,7 @@ build/
 # Local-only orchestration / quality infrastructure — never push.
 .dgov/
 .sentrux/
+
+# Per-session handover and napkin — auto-generated, never push.
+HANDOVER.md
+.napkin.md
