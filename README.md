@@ -117,6 +117,8 @@ All roles get 60 iterations by default (capped at 200), configurable per call.
 
 `firepass_trio` chains researcher, worker, and reviewer: the researcher gathers context, the worker implements, and the reviewer audits the result. The reviewer can send the worker back for fixes up to `max_review_rounds` times (default 2, capped at 5). The response is an XML envelope that contains each sub-result as a separate tag so the calling LLM can address them individually.
 
+For Fireworks rate-limit behavior, worker fan-out guidance, and the recommended path before running many parallel workers, see [docs/fireworks-scaling.md](docs/fireworks-scaling.md).
+
 ### Response format
 
 Every tool result is returned as an XML envelope so the calling LLM can read sub-results structurally.
