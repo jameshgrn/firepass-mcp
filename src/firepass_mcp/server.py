@@ -503,7 +503,8 @@ async def _run_trio_chain(
         return _build_trio_response("research_failed", 0, research_xml, [])
 
     # 2. First implementation
-    worker_context = research_xml
+    research_body = _extract_result_body(research_xml)
+    worker_context = f"Researcher findings:\n{research_body}"
     impl_xml = await firepass_worker(
         prompt, cwd, worker_context, max_iterations=max_iterations
     )
@@ -548,7 +549,8 @@ async def _run_trio_chain(
             return _build_trio_response(status, rounds_used, research_xml, rounds_xml)
 
         # Next round: append reviewer feedback to context and re-run worker
-        worker_context = f"{worker_context}\n\nReviewer feedback:\n{review_xml}"
+        reviewer_body = _extract_result_body(review_xml)
+        worker_context = f"{worker_context}\n\nReviewer feedback:\n{reviewer_body}"
         impl_xml = await firepass_worker(
             prompt, cwd, worker_context, max_iterations=max_iterations
         )

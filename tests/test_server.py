@@ -1166,3 +1166,74 @@ def test_firepass_trio_loops_when_needs_fixes_in_result(monkeypatch, tmp_path):
     assert call_counts["researcher"] == 1
     assert call_counts["worker"] == 2
     assert call_counts["reviewer"] == 2
+
+
+def test_firepass_trio_worker_receives_research_body_only(monkeypatch, tmp_path):
+    """Worker context must contain only the research <result> body, not the full envelope or <activity> noise."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+    worker_contexts: list[str] = []
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>FINDINGS_X</result><activity>ACTIVITY_NOISE</activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        worker_contexts.append(context)
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path)))
+
+    assert 'status="approved"' in result
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 1
+    assert call_counts["reviewer"] == 1
+    assert "FINDINGS_X" in worker_contexts[0]
+    assert "ACTIVITY_NOISE" not in worker_contexts[0]
+
+
+def test_firepass_trio_worker_receives_reviewer_body_on_loopback(monkeypatch, tmp_path):
+    """On loopback, worker context must contain only the reviewer <result> body, not <activity> noise."""
+    call_counts = {"researcher": 0, "worker": 0, "reviewer": 0}
+    worker_contexts: list[str] = []
+
+    async def fake_researcher(prompt, cwd, context, max_iterations):
+        call_counts["researcher"] += 1
+        return '<firepass_researcher status="completed" iterations="1" tool_calls="0"><result>FINDINGS_X</result><activity></activity></firepass_researcher>'
+
+    async def fake_worker(prompt, cwd, context, max_iterations):
+        call_counts["worker"] += 1
+        worker_contexts.append(context)
+        return '<firepass_worker status="completed" iterations="1" tool_calls="0"><result>code</result><activity></activity></firepass_worker>'
+
+    reviewer_calls = [0]
+
+    async def fake_reviewer(prompt, cwd, context, max_iterations):
+        call_counts["reviewer"] += 1
+        reviewer_calls[0] += 1
+        if reviewer_calls[0] == 1:
+            return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>VERDICT: NEEDS-FIXES\nFIX_THIS</result><activity>ACTIVITY_NOISE</activity></firepass_reviewer>'
+        return '<firepass_reviewer status="completed" iterations="1" tool_calls="0"><result>APPROVE</result><activity></activity></firepass_reviewer>'
+
+    monkeypatch.setattr("firepass_mcp.server.firepass_researcher", fake_researcher)
+    monkeypatch.setattr("firepass_mcp.server.firepass_worker", fake_worker)
+    monkeypatch.setattr("firepass_mcp.server.firepass_reviewer", fake_reviewer)
+
+    result = asyncio.run(firepass_trio("task", str(tmp_path), max_review_rounds=3))
+
+    assert 'status="approved"' in result
+    assert 'rounds="2"' in result
+    assert call_counts["researcher"] == 1
+    assert call_counts["worker"] == 2
+    assert call_counts["reviewer"] == 2
+    # Second worker invocation must include the reviewer result body, not activity noise
+    assert "FIX_THIS" in worker_contexts[1]
+    assert "ACTIVITY_NOISE" not in worker_contexts[1]
